@@ -1,4 +1,4 @@
-name: PUBG Extract
+name: PUBG Extract v3
 
 on: workflow_dispatch
 
@@ -9,22 +9,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install
-        run: pip install cryptography
+      - name: Install apkeep
+        run: |
+          cargo install apkeep --locked || true
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
       - name: Download APK
         run: |
-          mkdir apk
-          wget -q "https://github.com/richard09/apkeep/releases/latest/download/apkeep-x86_64-unknown-linux-gnu" -O apkeep
-          chmod +x apkeep
-          ./apkeep -d apkpure com.tencent.ig apk/ || echo "apkeep failed"
-          ls -la apk/
+          apkeep -d apkpure com.tencent.ig apk_out/
+          find apk_out/ -type f -exec ls -lh {} \;
 
       - name: Extract libs
         run: |
           mkdir libs
-          for f in $(find apk/ -name "*.apk" -o -name "*.xapk"); do
+          for f in $(find apk_out/ -name "*.apk" -o -name "*.xapk" -o -name "*.zip"); do
             unzip -o "$f" "lib/arm64-v8a/*.so" -d libs/ 2>/dev/null || true
+            unzip -o "$f" "lib/armeabi-v7a/*.so" -d libs/ 2>/dev/null || true
           done
           find libs/ -name "*.so" -exec ls -lh {} \;
 
@@ -46,20 +46,18 @@ jobs:
                   kb = bytes.fromhex(h)
                   if len(set(kb)) > 12:
                       keys.add(h)
-          for lib in so_files:
-              data = open(lib, 'rb').read()
               for m in re.finditer(rb'[0-9a-fA-F]{32}', data):
                   h = m.group().decode()
                   kb = bytes.fromhex(h)
                   if len(set(kb)) > 8:
                       keys.add(h)
           open('found_keys.txt', 'w').write('\n'.join(keys))
-          print(f"Total keys: {len(keys)}")
-          for k in sorted(keys)[:30]:
-              print(f"  {k}")
+          print(f"Total: {len(keys)}")
+          for k in sorted(keys)[:40]:
+              print(k)
           EOF
 
-      - name: Upload
+      - name: Upload keys
         uses: actions/upload-artifact@v4
         with:
           name: keys
