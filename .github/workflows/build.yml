@@ -1,4 +1,4 @@
-name: PUBG Extract v8
+name: PUBG PAK Decrypt (existing tools)
 
 on: workflow_dispatch
 
@@ -9,57 +9,214 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install apkeep
-        run: |
-          cargo install apkeep --locked || true
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
-      - name: Download APK
-        run: |
-          mkdir -p apk_out
-          APPROVE_ALL_APKPURE_RISKS=1 apkeep -a com.tencent.ig -d apk-pure apk_out/
-          find apk_out/ -type f -exec ls -lh {} \;
-
-      - name: Extract libs
-        run: |
-          mkdir libs
-          for f in $(find apk_out/ -name "*.apk" -o -name "*.xapk" -o -name "*.zip"); do
-            unzip -o "$f" "lib/arm64-v8a/*.so" -d libs/ 2>/dev/null || true
-            unzip -o "$f" "lib/armeabi-v7a/*.so" -d libs/ 2>/dev/null || true
-          done
-          find libs/ -name "*.so" -exec ls -lh {} \;
-
-      - name: Find keys
+      - name: Search GitHub for PUBG pak tools
         run: |
           python3 << 'EOF'
-          import os, re
-          so_files = []
-          for root, dirs, files in os.walk('libs'):
-              for f in files:
-                  if f.endswith('.so'):
-                      so_files.append(os.path.join(root, f))
-          print(f"Found {len(so_files)} libs")
-          keys = set()
-          for lib in so_files:
-              data = open(lib, 'rb').read()
-              for m in re.finditer(rb'[0-9a-fA-F]{64}', data):
-                  h = m.group().decode()
-                  kb = bytes.fromhex(h)
-                  if len(set(kb)) > 12:
-                      keys.add(h)
-              for m in re.finditer(rb'[0-9a-fA-F]{32}', data):
-                  h = m.group().decode()
-                  kb = bytes.fromhex(h)
-                  if len(set(kb)) > 8:
-                      keys.add(h)
-          open('found_keys.txt', 'w').write('\n'.join(keys))
-          print(f"Total: {len(keys)}")
-          for k in sorted(keys)[:40]:
-              print(k)
+          import requests, json
+
+          headers = {"Accept": "application/vnd.github.v3+json"}
+          queries = [
+              "pubg mobile pak decrypt",
+              "pubg mobile res_pufferpatch",
+              "pubg mobile pufferpatch extract",
+              "pubg mobile resource decrypt",
+              "tencent puffer pak decrypt",
+              "pubg mobile libUE4 key",
+              "pubg mobile pak key aes",
+          ]
+
+          repos = {}
+          for q in queries:
+              r = requests.get(
+                  f"https://api.github.com/search/repositories?q={q.replace(' ', '+')}&sort=stars&per_page=10",
+                  headers=headers
+              )
+              if r.status_code == 200:
+                  for item in r.json().get("items", []):
+                      repos[item["clone_url"]] = {
+                          "name": item["name"],
+                          "stars": item["stargazers_count"],
+                          "desc": item.get("description", ""),
+                          "url": item["clone_url"]
+                      }
+
+          # Sort by stars
+          sorted_repos = sorted(repos.values(), key=lambda x: -x["stars"])
+          print(f"Found {len(sorted_repos)} repos:\n")
+          for r in sorted_repos[:30]:
+              print(f"  ⭐{r['stars']:>4} | {r['name']}")
+              print(f"        {r['desc'][:80] if r['desc'] else 'No description'}")
+              print(f"        {r['url']}")
+              print()
+
+          json.dump(sorted_repos, open("repos.json", "w"), indent=2)
           EOF
 
-      - name: Upload keys
+      - name: Clone top repos
+        run: |
+          mkdir tools
+          python3 << 'EOF'
+          import json, subprocess, os
+
+          repos = json.load(open("repos.json"))
+          cloned = []
+
+          for repo in repos[:15]:
+              name = repo["name"].replace("/", "_").replace(" ", "_")
+              url = repo["url"]
+              print(f"Cloning: {name}")
+              try:
+                  subprocess.run(["git", "clone", "--depth", "1", url, f"tools/{name}"],
+                               timeout=30, capture_output=True)
+                  if os.path.exists(f"tools/{name}"):
+                      cloned.append(name)
+                      files = os.listdir(f"tools/{name}")
+                      print(f"  → {len(files)} files: {files[:10]}")
+              except Exception as e:
+                  print(f"  → failed: {e}")
+
+          print(f"\nCloned {len(cloned)} repos")
+          EOF
+
+      - name: Scan cloned tools for keys/scripts
+        run: |
+          python3 << 'PYEOF'
+          import os, re, json
+
+          tools_dir = "tools"
+          findings = {}
+
+          for root, dirs, files in os.walk(tools_dir):
+              for f in files:
+                  fp = os.path.join(root, f)
+                  ext = f.lower().split(".")[-1] if "." in f else ""
+                  
+                  # Text files — читаем
+                  if ext in ["py", "lua", "txt", "md", "json", "cfg", "ini", "yaml", "yml", "sh", "js", "cpp", "h", "c"]:
+                      try:
+                          content = open(fp, 'r', errors='ignore').read()
+                          
+                          # Ищем hex ключи
+                          hex_keys = re.findall(r'[0-9a-fA-F]{32,64}', content)
+                          if hex_keys:
+                              rel = os.path.relpath(fp, tools_dir)
+                              findings[rel] = {
+                                  "hex_keys": list(set(hex_keys))[:10],
+                                  "size": os.path.getsize(fp)
+                              }
+                              print(f"\n[KEY] {rel}")
+                              for k in set(hex_keys[:5]):
+                                  print(f"  {k}")
+                          
+                          # Ищем слова puffer/pak/decrypt/key
+                          keywords = ["puffer", "pak_key", "decrypt", "aes_key", "res_pufferpatch"]
+                          content_lower = content.lower()
+                          found_kw = [kw for kw in keywords if kw in content_lower]
+                          if found_kw:
+                              rel = os.path.relpath(fp, tools_dir)
+                              print(f"[MATCH] {rel}: {found_kw}")
+                              
+                      except:
+                          pass
+
+                  # Binary files — сканируем
+                  elif ext in ["so", "bin", "dat", "dll", "exe"]:
+                      try:
+                          data = open(fp, 'rb').read()
+                          hex_keys = re.findall(rb'[0-9a-fA-F]{64}', data)
+                          if hex_keys:
+                              rel = os.path.relpath(fp, tools_dir)
+                              print(f"\n[BIN KEY] {rel}")
+                              for h in set(hex_keys[:5]):
+                                  print(f"  {h.decode()}")
+                      except:
+                          pass
+
+          print(f"\n[+] Files with keys: {len(findings)}")
+          json.dump(findings, open("key_findings.json", "w"), indent=2)
+          PYEOF
+
+      - name: Try decrypt with found keys
+        run: |
+          python3 << 'PYEOF'
+          import os, re, json
+          from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+          PAK = "res_pufferpatch_4.6.0.21559.pak"
+          if not os.path.exists(PAK):
+              print("No pak")
+              exit(1)
+
+          data = open(PAK, 'rb').read()
+          print(f"PAK: {len(data)}b")
+
+          # Собираем все ключи из tools
+          keys = set()
+          for root, dirs, files in os.walk("tools"):
+              for f in files:
+                  fp = os.path.join(root, f)
+                  ext = f.lower().split(".")[-1] if "." in f else ""
+                  if ext in ["py", "lua", "txt", "json", "md", "cfg"]:
+                      try:
+                          content = open(fp, 'r', errors='ignore').read()
+                          for m in re.finditer(r'[0-9a-fA-F]{64}', content):
+                              keys.add(m.group())
+                      except:
+                          pass
+
+          # Из key_findings
+          if os.path.exists("key_findings.json"):
+              findings = json.load(open("key_findings.json"))
+              for fname, info in findings.items():
+                  for k in info.get("hex_keys", []):
+                      if len(k) == 64:
+                          keys.add(k)
+
+          print(f"Testing {len(keys)} keys...")
+
+          for ki, k_hex in enumerate(keys):
+              try:
+                  key = bytes.fromhex(k_hex)
+                  cipher = Cipher(algorithms.AES(key), modes.ECB())
+                  d = cipher.decryptor()
+                  dec = d.update(data[:256]) + d.finalize()
+
+                  for sig, name in [
+                      (b'\x1bLua', 'LUA'), (b'PK\x03\x04', 'ZIP'),
+                      (b'\x78\x9c', 'ZLIB'), (b'\x1f\x8b', 'GZIP'),
+                  ]:
+                      if sig in dec[:128]:
+                          print(f"\n[+] FOUND! Key: {k_hex}")
+                          print(f"    Signature: {name}")
+                          d2 = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
+                          full = d2.update(data) + d2.finalize()
+                          open('decrypted_pak.bin', 'wb').write(full)
+                          print(f"    Saved decrypted_pak.bin")
+                          exit(0)
+              except:
+                  pass
+
+          print("[-] No working key")
+          PYEOF
+
+      - name: Upload tools + findings
         uses: actions/upload-artifact@v4
         with:
-          name: keys
-          path: found_keys.txt
+          name: pubg-tools
+          path: |
+            repos.json
+            key_findings.json
+            decrypted_pak.bin
+        if-no-files-found: ignore
+
+      - name: Show tool list
+        run: |
+          echo "=== Cloned tools ==="
+          ls -la tools/
+          echo ""
+          echo "=== Tool contents ==="
+          for d in tools/*/; do
+            echo "--- $d ---"
+            ls "$d" | head -15
+            echo ""
+          done
