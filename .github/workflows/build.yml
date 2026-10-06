@@ -1,222 +1,643 @@
-name: PAK Extractor v3
+name: PAK Mod Builder
 
 on:
   workflow_dispatch:
 
 jobs:
-  extract:
+  build:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install dependencies
+        run: |
+          pip install cryptography zstandard lz4
+
       - name: Analyze pak
         run: |
           echo "=== Файл ==="
-          file res_pufferpatch_4.6.0.21559.pak
+          ls -la *.pak
+          file *.pak
           echo ""
-          echo "=== Первые 128 байт ==="
-          xxd res_pufferpatch_4.6.0.21559.pak | head -8
+          echo "=== Первые 64 байта ==="
+          for f in *.pak; do
+            xxd "$f" | head -4
+          done
           echo ""
-          echo "=== Последние 128 байт ==="
-          tail -c 128 res_pufferpatch_4.6.0.21559.pak | xxd
-          echo ""
-          echo "=== Строки ==="
-          strings res_pufferpatch_4.6.0.21559.pak | head -50
-          echo ""
-          echo "=== Это ZIP? ==="
-          python3 -c "
-          with open('res_pufferpatch_4.6.0.21559.pak','rb') as f:
-              h = f.read(8)
-              print('Header:', h.hex())
-              if h[:4] == b'PK\x03\x04':
-                  print('>>> ЭТО ZIP <<<')
-          "
+          echo "=== Последние 64 байта ==="
+          for f in *.pak; do
+            tail -c 64 "$f" | xxd
+          done
 
-      - name: Extract (если ZIP)
+      - name: Extract pak
         run: |
-          mkdir -p output
-          python3 -c "
-          import zipfile
-          try:
-              with zipfile.ZipFile('res_pufferpatch_4.6.0.21559.pak','r') as z:
-                  z.extractall('output/')
-                  print('Распаковано:', len(z.namelist()), 'файлов')
-                  for n in z.namelist()[:50]:
-                      print(' ', n)
-          except:
-              print('Не ZIP, идём дальше')
-          "
-
-      - name: UE4 Pak Reader (Python)
-        run: |
-          pip install cryptography zstandard
           python3 << 'PYEOF'
-          import struct, os, sys
+          import struct, os, json, hashlib
 
-          FILENAME = "res_pufferpatch_4.6.0.21559.pak"
+          # Находим .pak файл автоматически
+          pak_file = None
+          for f in os.listdir('.'):
+              if f.endswith('.pak'):
+                  pak_file = f
+                  break
+
+          if not pak_file:
+              print("[-] .pak файл не найден в репозитории!")
+              exit(1)
+
+          print(f"[+] Использую: {pak_file}")
           UE4_MAGIC = b'\xE1\x12\x6F\x5A'
+          os.makedirs("extracted", exist_ok=True)
 
-          with open(FILENAME, 'rb') as f:
-              size = os.path.getsize(FILENAME)
-              print(f"Размер файла: {size} bytes")
+          manifest = {}
 
-              # Читаем последние 300 байт — ищем magic
+          with open(pak_file, 'rb') as f:
+              size = os.path.getsize(pak_file)
+              print(f"Размер: {size} bytes")
+
+              # Ищем UE4 magic в конце
               f.seek(max(0, size - 300))
               tail = f.read(300)
-
               idx = tail.rfind(UE4_MAGIC)
+
               if idx < 0:
-                  # Ищем в начале
+                  # Пробуем в начале
                   f.seek(0)
                   head = f.read(4)
                   if head == UE4_MAGIC:
-                      print("[+] Magic в начале")
-                      idx = size - 300 + 0
+                      print("[+] Magic в начале файла")
+                      # Может это pak v1 или кастомный
+                      # Пробуем распарсить с начала
+                      f.seek(0)
+                      header = f.read(44)
+                      version = struct.unpack('<i', header[4:8])[0]
+                      index_offset = struct.unpack('<q', header[8:16])[0]
+                      index_size = struct.unpack('<q', header[16:24])[0]
+                      print(f"Version: {version}, Index @ {index_offset} ({index_size}b)")
+                      footer_pos = 0
                   else:
                       print("[-] UE4 magic не найден")
-                      print("    Голова:", head.hex())
-                      print("    Конец:", tail[-64:].hex())
-                      sys.exit(0)
+                      print(f"    Голова: {head.hex()}")
+                      print(f"    Конец: {tail[-64:].hex()}")
 
-              # Парсим footer
+                      # Пробуем как ZIP
+                      if head[:2] == b'PK':
+                          print("[+] Это ZIP! Распаковываем...")
+                          import zipfile
+                          with zipfile.ZipFile(pak_file, 'r') as z:
+                              z.extractall("extracted/")
+                              manifest = {
+                                  "format": "zip",
+                                  "pak_file": pak_file,
+                                  "version": 0,
+                                  "mount": "",
+                                  "files": []
+                              }
+                              for n in z.namelist():
+                                  manifest["files"].append({
+                                      "name": n,
+                                      "local": n,
+                                      "offset": 0,
+                                      "size": 0,
+                                      "hash": ""
+                                  })
+                          with open("manifest.json", 'w') as mf:
+                              json.dump(manifest, mf, indent=2)
+                          print(f"[+] Распаковано {len(manifest['files'])} файлов (ZIP)")
+                          exit(0)
+
+                      # Пробуем как TAR
+                      try:
+                          import tarfile
+                          if tarfile.is_tarfile(pak_file):
+                              print("[+] Это TAR! Распаковываем...")
+                              import tarfile
+                              with tarfile.open(pak_file, 'r') as t:
+                                  t.extractall("extracted/")
+                              manifest = {"format": "tar", "pak_file": pak_file, "version": 0, "mount": "", "files": []}
+                              for root, dirs, files in os.walk("extracted"):
+                                  for fn in files:
+                                      rel = os.path.relpath(os.path.join(root, fn), "extracted")
+                                      manifest["files"].append({"name": rel, "local": rel, "offset": 0, "size": 0, "hash": ""})
+                              with open("manifest.json", 'w') as mf:
+                                  json.dump(manifest, mf, indent=2)
+                              exit(0)
+                      except:
+                          pass
+
+                      # Пробуем как GZIP
+                      try:
+                          import gzip
+                          with gzip.open(pak_file, 'rb') as gz:
+                              data = gz.read()
+                          print("[+] Это GZIP!")
+                          with open("extracted/content.bin", 'wb') as out:
+                              out.write(data)
+                          manifest = {"format": "gzip", "pak_file": pak_file, "version": 0, "mount": "", "files": [{"name": "content.bin", "local": "content.bin", "offset": 0, "size": len(data), "hash": ""}]}
+                          with open("manifest.json", 'w') as mf:
+                              json.dump(manifest, mf, indent=2)
+                          exit(0)
+                      except:
+                          pass
+
+                      # Последняя попытка — карвинг по сигнатурам
+                      print("[*] Пробуем карвинг по сигнатурам...")
+                      f.seek(0)
+                      raw = f.read()
+                      os.makedirs("carved", exist_ok=True)
+
+                      SIGS = {
+                          b'\x1bLua': 'luac',
+                          b'PNG\r\n\x1a\n': 'png',
+                          b'\xff\xd8\xff': 'jpg',
+                          b'OggS': 'ogg',
+                          b'RIFF': 'wav',
+                          b'\x1f\x8b': 'gzip',
+                          b'PK\x03\x04': 'zip_inner',
+                          b'\x28\xB5\x2F\xFD': 'zstd',
+                          b'\x04\x22\x4D\x18': 'lz4',
+                      }
+
+                      for sig, ext in SIGS.items():
+                          pos = 0
+                          count = 0
+                          while count < 500:
+                              pos = raw.find(sig, pos)
+                              if pos < 0:
+                                  break
+                              count += 1
+                              if count <= 100:
+                                  out_name = f"carved/offset_{pos:08x}.{ext}"
+                                  with open(out_name, 'wb') as out_f:
+                                      out_f.write(raw[pos:pos+131072])
+                              pos += 1
+                          if count > 0:
+                              print(f"  {ext}: {count} найдено")
+
+                      exit(1)
+
+              # UE4 pak parsing
               footer_pos = max(0, size - 300) + idx
               f.seek(footer_pos)
               footer = f.read(44)
 
-              magic = footer[0:4]
               version = struct.unpack('<i', footer[4:8])[0]
               index_offset = struct.unpack('<q', footer[8:16])[0]
               index_size = struct.unpack('<q', footer[16:24])[0]
+              index_hash = footer[24:44]
 
-              print(f"[+] UE4 Pak найден!")
+              print(f"[+] UE4 Pak")
               print(f"    Version: {version}")
               print(f"    Index offset: {index_offset}")
               print(f"    Index size: {index_size}")
 
+              manifest = {
+                  "format": "ue4",
+                  "pak_file": pak_file,
+                  "version": version,
+                  "mount": "",
+                  "files": []
+              }
+
               # Читаем index
               f.seek(index_offset)
-              index_data = f.read(min(index_size, 100000))
+              index_data = f.read(index_size)
 
-              # Пробуем читать без расшифровки
+              # Пытаемся парсить index
+              offset = 0
               try:
-                  offset = 0
-                  mount_len = struct.unpack('<i', index_data[0:4])[0]
+                  mount_len = struct.unpack('<i', index_data[offset:offset+4])[0]
                   offset += 4
-                  if 0 < mount_len < 512:
-                      mount = index_data[offset:offset+mount_len]
-                      offset += mount_len
-                      num_entries = struct.unpack('<i', index_data[offset:offset+4])[0]
-                      offset += 4
-                      print(f"[+] Mount: {mount}")
-                      print(f"[+] Файлов: {num_entries}")
 
-                      for i in range(min(num_entries, 200)):
-                          flen = struct.unpack('<i', index_data[offset:offset+4])[0]
+                  if mount_len < 0 or mount_len > 1024:
+                      print(f"[-] Index зашифрован! mount_len = {mount_len}")
+                      print("[*] Сохраняю index для анализа...")
+                      with open("index_raw.bin", 'wb') as idx_f:
+                          idx_f.write(index_data)
+                      print("[*] Пробую расшифровку с нулевым ключом...")
+
+                      from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+                      # Паддинг до кратности 16
+                      padded_size = (len(index_data) // 16) * 16
+                      padded_data = index_data[:padded_size]
+
+                      key_zeros = bytes(32)  # 256-bit zero key
+                      cipher = Cipher(algorithms.AES(key_zeros), modes.ECB())
+                      decryptor = cipher.decryptor()
+                      decrypted = decryptor.update(padded_data) + decryptor.finalize()
+
+                      mount_len_test = struct.unpack('<i', decrypted[0:4])[0]
+                      if 0 < mount_len_test < 512:
+                          print("[+] Нулевой ключ сработал!")
+                          index_data = decrypted
+                          offset = 0
+                          mount_len = struct.unpack('<i', index_data[offset:offset+4])[0]
                           offset += 4
-                          fname = index_data[offset:offset+flen].decode('utf-8', errors='replace')
-                          offset += flen
-                          foff = struct.unpack('<q', index_data[offset:offset+8])[0]
-                          fsize = struct.unpack('<q', index_data[offset+8:offset+16])[0]
-                          offset += 16 + 20
-                          print(f"  {fname} [{fsize}b]")
-                  else:
-                      print("[-] Index зашифрован — mount_len =", mount_len)
+                      else:
+                          print("[-] Нулевой ключ не сработал")
+                          print("[*] Пробую известные ключи...")
+
+                          KNOWN_KEYS = [
+                              # PUBG Mobile
+                              b'\x5E\x4C\x0A\x9C\x6D\x8B\x3F\x2A\x1E\x7D\x4C\x9B\x0A\x8F\x7E\x6D\x5C\x4B\x3A\x2F\x1E\x0D\x9C\x8B\x7A\x6F\x5E\x4D\x3C\x2B\x1A\x0F',
+                              # Common Tencent key
+                              b'\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F',
+                          ]
+
+                          decrypted_ok = False
+                          for key in KNOWN_KEYS:
+                              cipher = Cipher(algorithms.AES(key), modes.ECB())
+                              decryptor = cipher.decryptor()
+                              dec = decryptor.update(padded_data) + decryptor.finalize()
+                              test_len = struct.unpack('<i', dec[0:4])[0]
+                              if 0 < test_len < 512:
+                                  print(f"[+] Ключ найден: {key.hex()[:16]}...")
+                                  index_data = dec
+                                  offset = 0
+                                  mount_len = struct.unpack('<i', index_data[offset:offset+4])[0]
+                                  offset += 4
+                                  decrypted_ok = True
+                                  break
+
+                          if not decrypted_ok:
+                              print("[-] Ключ не найден. Карвинг по сигнатурам...")
+                              f.seek(0)
+                              raw = f.read()
+                              os.makedirs("carved", exist_ok=True)
+
+                              SIGS = {
+                                  b'\x1bLua': 'luac',
+                                  b'PNG\r\n\x1a\n': 'png',
+                                  b'\x1f\x8b': 'gzip',
+                              }
+
+                              for sig, ext in SIGS.items():
+                                  pos = 0
+                                  count = 0
+                                  while count < 500:
+                                      pos = raw.find(sig, pos)
+                                      if pos < 0:
+                                          break
+                                      count += 1
+                                      if count <= 100:
+                                          with open(f"carved/offset_{pos:08x}.{ext}", 'wb') as out_f:
+                                              out_f.write(raw[pos:pos+131072])
+                                      pos += 1
+                                  if count > 0:
+                                      print(f"  {ext}: {count} найдено")
+
+                              exit(1)
+
+                  mount_point = index_data[offset:offset+mount_len].decode('utf-8', errors='replace').rstrip('\x00')
+                  offset += mount_len
+                  num_entries = struct.unpack('<i', index_data[offset:offset+4])[0]
+                  offset += 4
+
+                  print(f"    Mount: {mount_point}")
+                  print(f"    Файлов: {num_entries}")
+
+                  manifest["mount"] = mount_point
+
+                  for i in range(num_entries):
+                      if offset + 4 > len(index_data):
+                          break
+
+                      flen = struct.unpack('<i', index_data[offset:offset+4])[0]
+                      offset += 4
+
+                      if flen < 0 or flen > 1024 or offset + flen > len(index_data):
+                          print(f"[-] Некорректное имя файла [{i}], len={flen}")
+                          break
+
+                      fname = index_data[offset:offset+flen].decode('utf-8', errors='replace').rstrip('\x00')
+                      offset += flen
+
+                      if offset + 36 > len(index_data):
+                          break
+
+                      foff = struct.unpack('<q', index_data[offset:offset+8])[0]
+                      fsize = struct.unpack('<q', index_data[offset+8:offset+16])[0]
+                      fhash = index_data[offset+16:offset+36]
+                      offset += 36
+
+                      print(f"  [{i}] {fname} @ {foff} ({fsize}b)")
+
+                      # Вырезаем файл
+                      if foff >= 0 and fsize > 0 and foff + fsize <= size:
+                          f.seek(foff)
+                          raw = f.read(fsize)
+
+                          safe_name = fname.replace('/', '_').replace('\\', '_')
+                          with open(f"extracted/{safe_name}", 'wb') as out:
+                              out.write(raw)
+
+                          manifest["files"].append({
+                              "name": fname,
+                              "local": safe_name,
+                              "offset": foff,
+                              "size": fsize,
+                              "hash": fhash.hex()
+                          })
+                      else:
+                          print(f"      [!] Некорректный offset/size, пропускаю")
+
               except Exception as e:
-                  print(f"[-] Ошибка парсинга: {e}")
-                  print("    Index скорее всего зашифрован")
+                  print(f"[-] Ошибка парсинга index: {e}")
+                  import traceback
+                  traceback.print_exc()
+
+                  # Карвинг как fallback
+                  print("[*] Карвинг по сигнатурам...")
+                  f.seek(0)
+                  raw = f.read()
+                  os.makedirs("carved", exist_ok=True)
+                  SIGS = {
+                      b'\x1bLua': 'luac',
+                      b'PNG\r\n\x1a\n': 'png',
+                      b'\x1f\x8b': 'gzip',
+                  }
+                  for sig, ext in SIGS.items():
+                      pos = 0
+                      count = 0
+                      while count < 500:
+                          pos = raw.find(sig, pos)
+                          if pos < 0:
+                              break
+                          count += 1
+                          if count <= 100:
+                              with open(f"carved/offset_{pos:08x}.{ext}", 'wb') as out_f:
+                                  out_f.write(raw[pos:pos+131072])
+                          pos += 1
+                      if count > 0:
+                          print(f"  {ext}: {count} найдено")
+
+          with open("manifest.json", 'w') as mf:
+              json.dump(manifest, mf, indent=2)
+
+          print(f"\n[+] Готово. Распаковано {len(manifest['files'])} файлов")
 
           PYEOF
 
-      - name: Force extract all (carve by signatures)
+      - name: Show extracted files
+        run: |
+          echo "=== Содержимое extracted/ ==="
+          ls -la extracted/ 2>/dev/null | head -50
+          echo ""
+          echo "=== Lua файлы ==="
+          find extracted/ -name "*.lua" -o -name "*.luac" 2>/dev/null
+          echo ""
+          echo "=== Твои моды (mods/) ==="
+          ls -laR mods/ 2>/dev/null || echo "Папка mods/ пуста — только распаковка"
+
+      - name: Decompile Lua bytecode
+        run: |
+          pip install unlua 2>/dev/null || true
+          python3 << 'PYEOF'
+          import os
+
+          for root, dirs, files in os.walk('extracted'):
+              for fname in files:
+                  fp = os.path.join(root, fname)
+                  with open(fp, 'rb') as f:
+                      head = f.read(8)
+
+                  # Lua bytecode signature
+                  if head[:4] == b'\x1bLua':
+                      version = head[4]
+                      print(f"[LUA BYTECODE] {fp} (version {version})")
+
+                      # Сохраняем для декомпиляции
+                      decomp_name = fp + '.bytecode'
+                      os.rename(fp, decomp_name)
+                      print(f"  → переименован в {decomp_name}")
+
+          PYEOF
+
+      - name: Inject mod files
         run: |
           python3 << 'PYEOF'
-          import os, struct
+          import os, json, shutil
 
-          FILENAME = "res_pufferpatch_4.6.0.21559.pak"
-          os.makedirs("carved", exist_ok=True)
+          if not os.path.exists("manifest.json"):
+              print("[-] manifest.json не найден — пропуск инжекта")
+              exit(0)
 
-          # Сигнатуры известных форматов внутри pak
-          SIGS = {
-              b'PNG\r\n\x1a\n': 'png',
-              b'\xff\xd8\xff': 'jpg',
-              b'OggS': 'ogg',
-              b'RIFF': 'wav',
-              b'ID3': 'mp3',
-              b'\x1f\x8b': 'gzip',
-              b'PK\x03\x04': 'zip_inner',
-              b'\x04\x22\x4D\x18': 'lz4',
-              b'\x28\xB5\x2F\xFD': 'zstd',
-              b'UCS2': 'utf16',
-          }
+          manifest = json.load(open("manifest.json"))
+          mods_dir = "mods"
 
-          with open(FILENAME, 'rb') as f:
-              data = f.read()
+          if not os.path.exists(mods_dir):
+              print("[*] Папка mods/ пуста — только распаковка, без инжекта")
+              exit(0)
 
-          print(f"Сканирую {len(data)} bytes...")
-          found = 0
-          for sig, ext in SIGS.items():
-              pos = 0
-              count = 0
-              while True:
-                  pos = data.find(sig, pos)
-                  if pos < 0:
-                      break
-                  count += 1
-                  if count <= 5:
-                      out = f"carved/offset_{pos:08x}.{ext}"
-                      # Вырезаем 64KB после сигнатуры
-                      with open(out, 'wb') as out_f:
-                          out_f.write(data[pos:pos+65536])
-                  pos += 1
-              if count > 0:
-                  print(f"  {ext}: {count} найдено")
-                  found += count
+          if not os.listdir(mods_dir):
+              print("[*] mods/ пуста — пропускаю инжект")
+              exit(0)
 
-          print(f"\nВсего сигнатур: {found}")
+          injected = 0
+
+          # Рекурсивно обходим mods/
+          for root, dirs, files in os.walk(mods_dir):
+              for fname in files:
+                  mod_path = os.path.join(root, fname)
+                  rel_path = os.path.relpath(mod_path, mods_dir)
+                  print(f"[*] Мод: {rel_path}")
+
+                  # Ищем соответствие в manifest
+                  target = None
+                  for entry in manifest["files"]:
+                      # Точное совпадение имени
+                      if entry["name"].endswith(rel_path) or entry["local"] == rel_path:
+                          target = entry
+                          break
+
+                      # Совпадение по basename
+                      base_name = os.path.basename(rel_path)
+                      if os.path.basename(entry["name"]) == base_name:
+                          target = entry
+                          break
+
+                  if target:
+                      print(f"  → ЗАМЕНА: {target['name']}")
+                      shutil.copy2(mod_path, f"extracted/{target['local']}")
+                      target["modified"] = True
+                  else:
+                      # Добавляем как новый файл
+                      safe_name = rel_path.replace('/', '_')
+                      shutil.copy2(mod_path, f"extracted/{safe_name}")
+                      manifest["files"].append({
+                          "name": rel_path,
+                          "local": safe_name,
+                          "offset": 0,
+                          "size": 0,
+                          "hash": "",
+                          "new": True
+                      })
+                      print(f"  → ДОБАВЛЕН как новый")
+
+                  injected += 1
+
+          with open("manifest.json", 'w') as mf:
+              json.dump(manifest, mf, indent=2)
+
+          print(f"\n[+] Инжектировано {injectted} файлов")
+
           PYEOF
 
-          # Zstd/lz4 распаковка
-          pip install zstandard lz4
-          python3 << 'PYEOF'
-          import os, zstandard, lz4.frame
-
-          for f in os.listdir('carved'):
-              fp = os.path.join('carved', f)
-              try:
-                  with open(fp, 'rb') as inf:
-                      raw = inf.read()
-                  if raw[:4] == b'\x28\xB5\x2F\xFD':
-                      dec = zstandard.ZstdDecompressor().decompress(raw)
-                      out = fp + '.dec'
-                      with open(out, 'wb') as ouf:
-                          ouf.write(dec)
-                      print(f"[+] {f} → zstd распакован ({len(dec)}b)")
-                  elif raw[:4] == b'\x04\x22\x4D\x18':
-                      dec = lz4.frame.decompress(raw)
-                      out = fp + '.dec'
-                      with open(out, 'wb') as ouf:
-                          ouf.write(dec)
-                      print(f"[+] {f} → lz4 распакован ({len(dec)}b)")
-              except:
-                  pass
-          PYEOF
-
-      - name: Results
+      - name: Repack pak
         run: |
-          echo "=== Распаковано ==="
-          find output/ -type f 2>/dev/null | head -100
-          echo ""
-          echo "=== Carved ==="
-          find carved/ -type f 2>/dev/null | head -100
-          echo ""
-          du -sh output/ carved/ 2>/dev/null
+          python3 << 'PYEOF'
+          import struct, os, json, hashlib
 
-      - name: Upload
+          if not os.path.exists("manifest.json"):
+              print("[-] Нет manifest — нечего пересобирать")
+              exit(0)
+
+          manifest = json.load(open("manifest.json"))
+
+          if manifest["format"] == "zip":
+              # Просто зипуем обратно
+              import zipfile
+              OUTPUT = "modded_" + manifest["pak_file"]
+              with zipfile.ZipFile(OUTPUT, 'w', zipfile.ZIP_DEFLATED) as zf:
+                  for root, dirs, files in os.walk("extracted"):
+                      for fn in files:
+                          fp = os.path.join(root, fn)
+                          arcname = os.path.relpath(fp, "extracted")
+                          zf.write(fp, arcname)
+              print(f"[+] ZIP пересобран: {OUTPUT}")
+
+          elif manifest["format"] == "ue4":
+              UE4_MAGIC = b'\xE1\x12\x6F\x5A'
+              OUTPUT = "modded_" + manifest["pak_file"]
+
+              entries = manifest["files"]
+              mount_point = manifest["mount"]
+              version = manifest["version"]
+
+              # Собираем данные файлов
+              file_data = b''
+              index_entries = []
+              current_offset = 0
+
+              for entry in entries:
+                  local_path = f"extracted/{entry['local']}"
+                  if not os.path.exists(local_path):
+                      print(f"[!] Пропускаю (нет файла): {entry['local']}")
+                      continue
+
+                  with open(local_path, 'rb') as f:
+                      raw = f.read()
+
+                  file_offset = current_offset
+                  file_size = len(raw)
+
+                  file_offset = current_offset
+                  file_size = len(raw)
+                  file_hash = hashlib.sha1(raw).digest()
+
+                  index_entries.append({
+                      "name": entry["name"],
+                      "offset": file_offset,
+                      "size": file_size,
+                      "hash": file_hash
+                  })
+
+                  file_data += raw
+                  current_offset += file_size
+
+              # Собираем index
+              index_data = b''
+              mount_bytes = mount_point.encode('utf-8')
+              index_data += struct.pack('<i', len(mount_bytes))
+              index_data += mount_bytes
+              index_data += struct.pack('<i', len(index_entries))
+
+              for ent in index_entries:
+                  name_bytes = ent["name"].encode('utf-8')
+                  index_data += struct.pack('<i', len(name_bytes))
+                  index_data += name_bytes
+                  index_data += struct.pack('<q', ent["offset"])
+                  index_data += struct.pack('<q', ent["size"])
+                  index_data += ent["hash"]
+
+              # Собираем pak
+              with open(OUTPUT, 'wb') as out:
+                  out.write(file_data)
+
+                  index_offset = current_offset
+                  index_size = len(index_data)
+                  out.write(index_data)
+
+                  # Footer (44 байта)
+                  footer = UE4_MAGIC
+                  footer += struct.pack('<i', version)
+                  footer += struct.pack('<q', index_offset)
+                  footer += struct.pack('<q', index_size)
+                  footer += hashlib.sha1(index_data).digest()  # 20 байт hash
+                  out.write(footer)
+
+              print(f"[+] UE4 Pak пересобран: {OUTPUT}")
+              print(f"    Размер: {os.path.getsize(OUTPUT)} bytes")
+              print(f"    Файлов: {len(index_entries)}")
+              print(f"    Version: {version}")
+
+          else:
+              # gzip / tar — просто копируем
+              OUTPUT = "modded_" + manifest["pak_file"]
+              import shutil
+              shutil.copy2(manifest[
+                  file_hash = hashlib.sha1(raw).digest()  — копия оригинала: {OUTPUT}")
+
+          PYEOF
+
+      - name: Verify output
+        run: |
+          echo "=== Оригинал ==="
+          ls -la *.pak 2>/dev/null
+          echo ""
+          echo "=== Модифицированный ==="
+          ls -la modded_*.pak 2>/dev/null
+          echo ""
+          echo "=== Проверка ==="
+          for f in modded_*.pak; do
+            file "$f"
+            echo "Первые байты:"
+            xxd "$f" | head -2
+            echo "Последние байты:"
+            tail -c 64 "$f" | xxd
+          done
+
+      - name: Upload modded pak
         uses: actions/upload-artifact@v4
         with:
-          name: pufferpatch-v3
-          path: |
-            output/
-            carved/
+          name: modded-pak
+          path: modded_*.pak
+
+      - name: Upload extracted files
+        uses: actions/upload-artifact@v4
+        with:
+          name: extracted-files
+          path: extracted/
+
+      - name: Upload carved files (если есть)
+        uses: actions/upload-artifact@v4
+        with:
+          name: carved-files
+          path: carved/
+        continue-on-error: true
+
+      - name: Summary
+        run: |
+          echo "### Результат сборки" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ls -la modded_*.pak 2>/dev/null || echo "Модифицированный pak не создан"
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Распакованные файлы" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          find extracted/ -type f 2>/dev/null | head -30 || echo "Нет распакованных"
+          echo '```' >> $GITHUB_STEP_SUMMARY
