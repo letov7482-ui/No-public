@@ -1,4 +1,4 @@
-name: PUBG Extract v5
+name: PUBG Extract v6
 
 on: workflow_dispatch
 
@@ -16,6 +16,7 @@ jobs:
 
       - name: Download APK
         run: |
+          mkdir -p apk_out
           apkeep -a com.tencent.ig -d apk-pure apk_out/
           find apk_out/ -type f -exec ls -lh {} \;
 
