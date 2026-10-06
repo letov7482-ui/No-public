@@ -1,4 +1,4 @@
-name: PUBG Tool Search
+name: Clone PUBG Lua
 
 on: workflow_dispatch
 
@@ -6,64 +6,39 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Search pak decrypt
-        run: curl -s "https://api.github.com/search/repositories?q=pubg+mobile+pak+decrypt&sort=stars&per_page=20" > r1.json
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Search pufferpatch
-        run: curl -s "https://api.github.com/search/repositories?q=pufferpatch&sort=stars&per_page=20" > r2.json
+      - name: Clone Lua Scripts
+        run: git clone https://github.com/0xPrince/PUBG-Mobile-Lua-Scripts.git lua_scripts
 
-      - name: Search pak key
-        run: curl -s "https://api.github.com/search/repositories?q=pubg+pak+key&sort=stars&per_page=20" > r3.json
+      - name: Clone MasterLua
+        run: git clone https://github.com/beyondbday69/MasterLua.git master_lua
 
-      - name: Search lua dump
-        run: curl -s "https://api.github.com/search/repositories?q=pubg+mobile+lua&sort=stars&per_page=20" > r4.json
-
-      - name: Search tencent resource
-        run: curl -s "https://api.github.com/search/repositories?q=tencent+game+resource+extractor&sort=stars&per_page=20" > r5.json
-
-      - name: Show results
+      - name: Explore
         run: |
-          echo "=== PAK DECRYPT ==="
-          cat r1.json | grep -o '"clone_url":"[^"]*"' | head -20
+          echo "=== PUBG Lua Scripts ==="
+          find lua_scripts/ -type f | head -50
           echo ""
-          echo "=== PUFFERPATCH ==="
-          cat r2.json | grep -o '"clone_url":"[^"]*"' | head -20
+          echo "Total files: $(find lua_scripts/ -type f | wc -l)"
           echo ""
-          echo "=== PAK KEY ==="
-          cat r3.json | grep -o '"clone_url":"[^"]*"' | head -20
+          echo "=== Lua files ==="
+          find lua_scripts/ -name "*.lua" | head -30
           echo ""
-          echo "=== LUA DUMP ==="
-          cat r4.json | grep -o '"clone_url":"[^"]*"' | head -20
-          echo ""
-          echo "=== TENCENT EXTRACTOR ==="
-          cat r5.json | grep -o '"clone_url":"[^"]*"' | head -20
-
-      - name: Clone top results
-        run: |
-          mkdir tools
-          for r in $(cat r1.json r2.json r3.json r4.json r5.json | grep '"clone_url"' | sed 's/.*"clone_url":"//;s/"//' | sort -u | head -15); do
-            name=$(echo "$r" | sed 's|https://github.com/||;s|\.git||;s|/|_|g')
-            git clone --depth 1 "$r" "tools/$name" 2>/dev/null || true
+          echo "=== Content sample ==="
+          for f in $(find lua_scripts/ -name "*.lua" | head -5); do
+            echo "--- $f ---"
+            head -30 "$f"
+            echo ""
           done
-          echo "=== Cloned ==="
-          ls -la tools/
-
-      - name: Scan for keys
-        run: |
-          grep -rE "[0-9a-fA-F]{64}" tools/ --include="*.py" --include="*.lua" --include="*.txt" --include="*.md" --include="*.json" --include="*.h" --include="*.cpp" | head -30
           echo ""
-          grep -rE "[0-9a-fA-F]{32}" tools/ --include="*.py" --include="*.lua" --include="*.txt" | head -30
-          echo ""
-          grep -ri "puffer\|pak_key\|aes_key\|decrypt" tools/ --include="*.py" --include="*.lua" --include="*.md" -l | head -20
+          echo "=== MasterLua ==="
+          find master_lua/ -type f | head -20
 
-      - name: Upload results
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: results
+          name: pubg-lua
           path: |
-            r1.json
-            r2.json
-            r3.json
-            r4.json
-            r5.json
-            tools/
+            lua_scripts/
+            master_lua/
