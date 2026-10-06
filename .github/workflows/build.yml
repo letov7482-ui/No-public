@@ -1,4 +1,4 @@
-name: PUBG Extract v7
+name: PUBG Extract v8
 
 on: workflow_dispatch
 
@@ -17,7 +17,7 @@ jobs:
       - name: Download APK
         run: |
           mkdir -p apk_out
-          apkeep -a com.tencent.ig -d apk-pure --approve-all-apkpure-risks apk_out/
+          APPROVE_ALL_APKPURE_RISKS=1 apkeep -a com.tencent.ig -d apk-pure apk_out/
           find apk_out/ -type f -exec ls -lh {} \;
 
       - name: Extract libs
