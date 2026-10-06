@@ -1,4 +1,4 @@
-name: Search PUBG dumps
+name: Search PUBG Dumps v2
 
 on: workflow_dispatch
 
@@ -6,46 +6,70 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Search repositories
+      - name: Search
         run: |
-          curl -s "https://api.github.com/search/repositories?q=pubg+mobile+dump+lua+decompile&per_page=20" > s1.json
-          curl -s "https://api.github.com/search/repositories?q=shadowtracker+lua&per_page=20" > s2.json
-          curl -s "https://api.github.com/search/code?q=puffer+lua+decrypt" > s3.json
-          curl -s "https://api.github.com/search/repositories?q=pubg+mobile+assets+extract&per_page=20" > s4.json
+          curl -s "https://api.github.com/search/repositories?q=pubg+mobile+decompile+lua&per_page=30" > s1.json
+          curl -s "https://api.github.com/search/repositories?q=shadowtracker+extra+lua&per_page=30" > s2.json
+          curl -s "https://api.github.com/search/repositories?q=pubg+mobile+cheat+lua&per_page=30" > s3.json
+          curl -s "https://api.github.com/search/repositories?q=pak+extract+tencent+mobile&per_page=30" > s4.json
 
-      - name: Show
+      - name: Parse results
         run: |
-          echo "=== DUMP ==="
-          cat s1.json | grep '"clone_url"' | head -20
-          echo ""
-          echo "=== SHADOWTRACKER ==="
-          cat s2.json | grep '"clone_url"' | head -20
-          echo ""
-          echo "=== CODE SEARCH ==="
-          cat s3.json | grep '"path"' | head -20
-          echo ""
-          echo "=== ASSETS ==="
-          cat s4.json | grep '"clone_url"' | head -20
+          python3 -c "
+          import json
+          for f in ['s1.json', 's2.json', 's3.json', 's4.json']:
+              print(f'=== {f} ===')
+              try:
+                  d = json.load(open(f))
+                  for item in d.get('items', []):
+                      print(f'{item[\"stargazers_count\"]:>4}* {item[\"clone_url\"]}')
+                      if item.get('description'):
+                          print(f'     {item[\"description\"][:80]}')
+                  print()
+              except Exception as e:
+                  print(f'error: {e}')
+          "
 
-      - name: Clone interesting
+      - name: Clone top 10
         run: |
           mkdir dump
-          for r in $(cat s1.json s2.json s4.json | grep '"clone_url"' | sed 's/.*"clone_url":"//;s/"//' | sort -u | head -10); do
-            name=$(echo "$r" | sed 's|https://github.com/||;s|\.git||;s|/|_|g')
-            git clone --depth 1 "$r" "dump/$name" 2>/dev/null || true
-          done
+          python3 -c "
+          import json, subprocess, os
+          urls = set()
+          for f in ['s1.json', 's2.json', 's3.json', 's4.json']:
+              try:
+                  d = json.load(open(f))
+                  for item in d.get('items', []):
+                      if item['stargazers_count'] >= 0:
+                          urls.add(item['clone_url'])
+              except: pass
+          for url in list(urls)[:10]:
+              name = url.replace('https://github.com/', '').replace('.git', '').replace('/', '_')
+              print(f'Cloning: {name}')
+              subprocess.run(['git', 'clone', '--depth', '1', url, f'dump/{name}'],
+                           capture_output=True, timeout=60)
+          "
           echo "=== Cloned ==="
           ls -la dump/
 
-      - name: Look for lua
+      - name: Find lua
         run: |
-          find dump/ -name "*.lua" -o -name "*.luac" | head -50
-          find dump/ -name "*.pak" | head -20
-          find dump/ -name "*.so" | head -20
-          find dump/ -type d | head -30
+          find dump/ -name "*.lua" -o -name "*.luac" 2>/dev/null | head -50
+          echo ""
+          echo "=== Lua file count ==="
+          find dump/ -name "*.lua" 2>/dev/null | wc -l
+
+      - name: Show samples
+        run: |
+          for f in $(find dump/ -name "*.lua" 2>/dev/null | head -3); do
+            echo "=== $f ==="
+            head -50 "$f"
+            echo ""
+          done
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: dump-results
+          name: dumps
           path: dump/
+        if-no-files-found: ignore
