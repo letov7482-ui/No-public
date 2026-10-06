@@ -1,4 +1,4 @@
-name: PAK Extractor v2
+name: PAK Extractor v3
 
 on:
   workflow_dispatch:
@@ -11,219 +11,212 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Analyze pak file
+      - name: Analyze pak
         run: |
           echo "=== Файл ==="
-          ls -la res_pufferpatch_4.6.0.21559.pak
           file res_pufferpatch_4.6.0.21559.pak
           echo ""
-          echo "=== Первые 128 байт (hex) ==="
+          echo "=== Первые 128 байт ==="
           xxd res_pufferpatch_4.6.0.21559.pak | head -8
           echo ""
-          echo "=== Последние 128 байт (hex) ==="
+          echo "=== Последние 128 байт ==="
           tail -c 128 res_pufferpatch_4.6.0.21559.pak | xxd
           echo ""
-          echo "=== Поиск сигнатур в файле ==="
-          strings res_pufferpatch_4.6.0.21559.pak | head -30
+          echo "=== Строки ==="
+          strings res_pufferpatch_4.6.0.21559.pak | head -50
+          echo ""
+          echo "=== Это ZIP? ==="
+          python3 -c "
+          with open('res_pufferpatch_4.6.0.21559.pak','rb') as f:
+              h = f.read(8)
+              print('Header:', h.hex())
+              if h[:4] == b'PK\x03\x04':
+                  print('>>> ЭТО ZIP <<<')
+          "
 
-      - name: Try QuickBMS (no key)
+      - name: Extract (если ZIP)
         run: |
           mkdir -p output
-          wget https://aluigi.altervista.org/papers/quickbms_linux.zip
-          unzip quickbms_linux.zip
-          chmod +x quickbms
-          wget https://aluigi.altervista.org/bms/unreal_tournament_4.bms
-          ./quickbms -V unreal_tournament_4.bms res_pufferpatch_4.6.0.21559.pak output/ || true
+          python3 -c "
+          import zipfile
+          try:
+              with zipfile.ZipFile('res_pufferpatch_4.6.0.21559.pak','r') as z:
+                  z.extractall('output/')
+                  print('Распаковано:', len(z.namelist()), 'файлов')
+                  for n in z.namelist()[:50]:
+                      print(' ', n)
+          except:
+              print('Не ZIP, идём дальше')
+          "
 
-      - name: Try Python UE4 pak reader
+      - name: UE4 Pak Reader (Python)
         run: |
           pip install cryptography zstandard
-
           python3 << 'PYEOF'
           import struct, os, sys
-          from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
           FILENAME = "res_pufferpatch_4.6.0.21559.pak"
           UE4_MAGIC = b'\xE1\x12\x6F\x5A'
 
-          # Известные ключи Tencent (публичные)
-          KNOWN_KEYS = [
-              # PUBG Mobile / Peacekeeper Elite
-              "0x5E4C0A9C6D8B3F2A1E7D4C9B0A8F7E6D5C4B3A2F1E0D9C8B7A6F5E4D3C2B1A0",
-              # Common defaults
-              "0x0000000000000000000000000000000000000000000000000000000000000000",
-          ]
+          with open(FILENAME, 'rb') as f:
+              size = os.path.getsize(FILENAME)
+              print(f"Размер файла: {size} bytes")
 
-          def try_read_pak():
-              with open(FILENAME, 'rb') as f:
-                  # Читаем footer
-                  f.seek(-44, 2)
-                  footer = f.read(44)
+              # Читаем последние 300 байт — ищем magic
+              f.seek(max(0, size - 300))
+              tail = f.read(300)
 
-                  magic = footer[0:4]
-                  if magic != UE4_MAGIC:
-                      # Пробуем найти magic в конце
-                      f.seek(-200, 2)
-                      tail = f.read(200)
-                      idx = tail.find(UE4_MAGIC)
-                      if idx >= 0:
-                          footer = tail[idx:idx+44]
-                          magic = UE4_MAGIC
-                      else:
-                          print("[-] Не UE4 pak magic")
-                          return
+              idx = tail.rfind(UE4_MAGIC)
+              if idx < 0:
+                  # Ищем в начале
+                  f.seek(0)
+                  head = f.read(4)
+                  if head == UE4_MAGIC:
+                      print("[+] Magic в начале")
+                      idx = size - 300 + 0
+                  else:
+                      print("[-] UE4 magic не найден")
+                      print("    Голова:", head.hex())
+                      print("    Конец:", tail[-64:].hex())
+                      sys.exit(0)
 
-                  print(f"[+] UE4 Magic найден")
+              # Парсим footer
+              footer_pos = max(0, size - 300) + idx
+              f.seek(footer_pos)
+              footer = f.read(44)
 
-                  version = struct.unpack('<i', footer[4:8])[0]
-                  index_offset = struct.unpack('<q', footer[8:16])[0]
-                  index_size = struct.unpack('<q', footer[16:24])[0]
-                  index_hash = footer[24:44]
+              magic = footer[0:4]
+              version = struct.unpack('<i', footer[4:8])[0]
+              index_offset = struct.unpack('<q', footer[8:16])[0]
+              index_size = struct.unpack('<q', footer[16:24])[0]
 
-                  print(f"    Версия: {version}")
-                  print(f"    Index offset: {index_offset}")
-                  print(f"    Index size: {index_size}")
+              print(f"[+] UE4 Pak найден!")
+              print(f"    Version: {version}")
+              print(f"    Index offset: {index_offset}")
+              print(f"    Index size: {index_size}")
 
-                  # Читаем index
-                  f.seek(index_offset)
-                  index_data = f.read(index_size)
+              # Читаем index
+              f.seek(index_offset)
+              index_data = f.read(min(index_size, 100000))
 
-                  # Пробуем расшифровать index известными ключами
-                  for key_hex in KNOWN_KEYS:
-                      try:
-                          key_bytes = bytes.fromhex(key_hex.replace("0x",""))
-                          cipher = Cipher(algorithms.AES(key_bytes), modes.ECB())
-                          decryptor = cipher.decryptor()
-                          decrypted = decryptor.update(index_data) + decryptor.finalize()
-                          # Проверяем есть ли читаемый контент
-                          print(f"[+] Расшифровка с ключом {key_hex[:16]}... — пробуем прочитать")
-                          parse_index(decrypted, version)
-                          break
-                      except Exception as e:
-                          print(f"[-] Ключ {key_hex[:16]}... не подошёл: {e}")
-                          # Пробуем без шифрования
-                          try:
-                              parse_index(index_data, version)
-                              print("[+] Index без шифрования — работает!")
-                              break
-                          except:
-                              pass
-
-          def parse_index(data, version):
-              offset = 0
-              mount_point_len = struct.unpack('<i', data[offset:offset+4])[0]
-              offset += 4
-
-              if mount_point_len < 0 or mount_point_len > 1024:
-                  print(f"[-] Некорректная длина mount point: {mount_point_len}")
-                  return
-
-              mount_point = data[offset:offset+mount_point_len].decode('utf-8', errors='replace')
-              offset += mount_point_len
-              print(f"[+] Mount point: {mount_point}")
-
-              num_entries = struct.unpack('<i', data[offset:offset+4])[0]
-              offset += 4
-              print(f"[+] Файлов в индексе: {num_entries}")
-
-              for i in range(min(num_entries, 50)):
-                  fname_len = struct.unpack('<i', data[offset:offset+4])[0]
+              # Пробуем читать без расшифровки
+              try:
+                  offset = 0
+                  mount_len = struct.unpack('<i', index_data[0:4])[0]
                   offset += 4
-                  fname = data[offset:offset+fname_len].decode('utf-8', errors='replace')
-                  offset += fname_len
+                  if 0 < mount_len < 512:
+                      mount = index_data[offset:offset+mount_len]
+                      offset += mount_len
+                      num_entries = struct.unpack('<i', index_data[offset:offset+4])[0]
+                      offset += 4
+                      print(f"[+] Mount: {mount}")
+                      print(f"[+] Файлов: {num_entries}")
 
-                  entry_offset = struct.unpack('<q', data[offset:offset+8])[0]
-                  entry_size = struct.unpack('<q', data[offset+8:offset+16])[0]
-                  offset += 16 + 20  # offset, size, hash
+                      for i in range(min(num_entries, 200)):
+                          flen = struct.unpack('<i', index_data[offset:offset+4])[0]
+                          offset += 4
+                          fname = index_data[offset:offset+flen].decode('utf-8', errors='replace')
+                          offset += flen
+                          foff = struct.unpack('<q', index_data[offset:offset+8])[0]
+                          fsize = struct.unpack('<q', index_data[offset+8:offset+16])[0]
+                          offset += 16 + 20
+                          print(f"  {fname} [{fsize}b]")
+                  else:
+                      print("[-] Index зашифрован — mount_len =", mount_len)
+              except Exception as e:
+                  print(f"[-] Ошибка парсинга: {e}")
+                  print("    Index скорее всего зашифрован")
 
-                  print(f"    {fname} ({entry_size} bytes)")
-
-                  if i == 0:
-                      print(f"    [Формат читается! Сохраняем полный список...]")
-
-              if num_entries > 50:
-                  print(f"    ... и ещё {num_entries - 50} файлов")
-
-          try_read_pak()
           PYEOF
 
-      - name: Try Custom Tencent Puffer format
+      - name: Force extract all (carve by signatures)
         run: |
           python3 << 'PYEOF'
-          import struct
+          import os, struct
 
           FILENAME = "res_pufferpatch_4.6.0.21559.pak"
+          os.makedirs("carved", exist_ok=True)
+
+          # Сигнатуры известных форматов внутри pak
+          SIGS = {
+              b'PNG\r\n\x1a\n': 'png',
+              b'\xff\xd8\xff': 'jpg',
+              b'OggS': 'ogg',
+              b'RIFF': 'wav',
+              b'ID3': 'mp3',
+              b'\x1f\x8b': 'gzip',
+              b'PK\x03\x04': 'zip_inner',
+              b'\x04\x22\x4D\x18': 'lz4',
+              b'\x28\xB5\x2F\xFD': 'zstd',
+              b'UCS2': 'utf16',
+          }
 
           with open(FILENAME, 'rb') as f:
-              header = f.read(64)
+              data = f.read()
 
-              # Tencent puffer может использовать свой формат
-              # Проверяем разные сигнатуры
-              sigs = {
-                  b'NPAK': 'Tencent NMPAK',
-                  b'PACK': 'Standard PACK',
-                  b'PK\x03\x04': 'ZIP (переименованный)',
-                  b'\x89PNG': 'PNG (не pak)',
-                  b'Rar!': 'RAR',
-                  b'7z\xbc\xaf': '7Z',
-                  b'PVR\x03': 'PVR texture',
-                  b'KTEX': 'Kingsoft/KT texture',
-                  b'\x04\x22\x4D\x18': 'LZ4',
-                  b'\x28\xB5\x2F\xFD': 'Zstandard',
-              }
-
-              print("=== Проверка сигнатур ===")
-              for sig, name in sigs.items():
-                  if header[:len(sig)] == sig:
-                      print(f"[+] Совпадение: {name}")
+          print(f"Сканирую {len(data)} bytes...")
+          found = 0
+          for sig, ext in SIGS.items():
+              pos = 0
+              count = 0
+              while True:
+                  pos = data.find(sig, pos)
+                  if pos < 0:
                       break
+                  count += 1
+                  if count <= 5:
+                      out = f"carved/offset_{pos:08x}.{ext}"
+                      # Вырезаем 64KB после сигнатуры
+                      with open(out, 'wb') as out_f:
+                          out_f.write(data[pos:pos+65536])
+                  pos += 1
+              if count > 0:
+                  print(f"  {ext}: {count} найдено")
+                  found += count
 
-              # Если это ZIP — просто распаковываем
-              if header[:2] == b'PK':
-                  print("[+] Это ZIP! Распаковываем...")
-                  import zipfile
-                  with zipfile.ZipFile(FILENAME, 'r') as z:
-                      z.extractall("output/")
-                      for name in z.namelist()[:30]:
-                          print(f"    {name}")
-              else:
-                  # Выводим все строки
-                  print("\n=== Строки в файле ===")
-                  with open(FILENAME, 'rb') as f2:
-                      chunk = f2.read(4096)
-                      strings_found = []
-                      current = b''
-                      for byte in chunk:
-                          if 32 <= byte <= 126:
-                              current += bytes([byte])
-                          else:
-                              if len(current) >= 6:
-                                  strings_found.append(current.decode())
-                              current = b''
-                      for s in strings_found[:40]:
-                          print(f"    {s}")
-
-          print("\n=== Размер файла ===")
-          size = os.path.getsize(FILENAME) if 'os' in dir() else 0
+          print(f"\nВсего сигнатур: {found}")
           PYEOF
 
-      - name: Check if ZIP (fallback)
-        run: |
-          if file res_pufferpatch_4.6.0.21559.pak | grep -qi "zip\|archive"; then
-            mkdir -p output
-            unzip -o res_pufferpatch_4.6.0.21559.pak -d output/
-          fi
+          # Zstd/lz4 распаковка
+          pip install zstandard lz4
+          python3 << 'PYEOF'
+          import os, zstandard, lz4.frame
 
-      - name: List all results
+          for f in os.listdir('carved'):
+              fp = os.path.join('carved', f)
+              try:
+                  with open(fp, 'rb') as inf:
+                      raw = inf.read()
+                  if raw[:4] == b'\x28\xB5\x2F\xFD':
+                      dec = zstandard.ZstdDecompressor().decompress(raw)
+                      out = fp + '.dec'
+                      with open(out, 'wb') as ouf:
+                          ouf.write(dec)
+                      print(f"[+] {f} → zstd распакован ({len(dec)}b)")
+                  elif raw[:4] == b'\x04\x22\x4D\x18':
+                      dec = lz4.frame.decompress(raw)
+                      out = fp + '.dec'
+                      with open(out, 'wb') as ouf:
+                          ouf.write(dec)
+                      print(f"[+] {f} → lz4 распакован ({len(dec)}b)")
+              except:
+                  pass
+          PYEOF
+
+      - name: Results
         run: |
-          echo "=== Распакованные файлы ==="
+          echo "=== Распаковано ==="
           find output/ -type f 2>/dev/null | head -100
           echo ""
-          echo "=== Размер ==="
-          du -sh output/ 2>/dev/null
+          echo "=== Carved ==="
+          find carved/ -type f 2>/dev/null | head -100
+          echo ""
+          du -sh output/ carved/ 2>/dev/null
 
-      - name: Upload results
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: pufferpatch-extracted
-          path: output/
+          name: pufferpatch-v3
+          path: |
+            output/
+            carved/
