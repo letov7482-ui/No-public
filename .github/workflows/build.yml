@@ -1,4 +1,4 @@
-name: PUBG PAK Decrypt (existing tools)
+name: PUBG Tool Search
 
 on: workflow_dispatch
 
@@ -6,217 +6,64 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Search pak decrypt
+        run: curl -s "https://api.github.com/search/repositories?q=pubg+mobile+pak+decrypt&sort=stars&per_page=20" > r1.json
 
-      - name: Search GitHub for PUBG pak tools
+      - name: Search pufferpatch
+        run: curl -s "https://api.github.com/search/repositories?q=pufferpatch&sort=stars&per_page=20" > r2.json
+
+      - name: Search pak key
+        run: curl -s "https://api.github.com/search/repositories?q=pubg+pak+key&sort=stars&per_page=20" > r3.json
+
+      - name: Search lua dump
+        run: curl -s "https://api.github.com/search/repositories?q=pubg+mobile+lua&sort=stars&per_page=20" > r4.json
+
+      - name: Search tencent resource
+        run: curl -s "https://api.github.com/search/repositories?q=tencent+game+resource+extractor&sort=stars&per_page=20" > r5.json
+
+      - name: Show results
         run: |
-          python3 << 'EOF'
-          import requests, json
+          echo "=== PAK DECRYPT ==="
+          cat r1.json | grep -o '"clone_url":"[^"]*"' | head -20
+          echo ""
+          echo "=== PUFFERPATCH ==="
+          cat r2.json | grep -o '"clone_url":"[^"]*"' | head -20
+          echo ""
+          echo "=== PAK KEY ==="
+          cat r3.json | grep -o '"clone_url":"[^"]*"' | head -20
+          echo ""
+          echo "=== LUA DUMP ==="
+          cat r4.json | grep -o '"clone_url":"[^"]*"' | head -20
+          echo ""
+          echo "=== TENCENT EXTRACTOR ==="
+          cat r5.json | grep -o '"clone_url":"[^"]*"' | head -20
 
-          headers = {"Accept": "application/vnd.github.v3+json"}
-          queries = [
-              "pubg mobile pak decrypt",
-              "pubg mobile res_pufferpatch",
-              "pubg mobile pufferpatch extract",
-              "pubg mobile resource decrypt",
-              "tencent puffer pak decrypt",
-              "pubg mobile libUE4 key",
-              "pubg mobile pak key aes",
-          ]
-
-          repos = {}
-          for q in queries:
-              r = requests.get(
-                  f"https://api.github.com/search/repositories?q={q.replace(' ', '+')}&sort=stars&per_page=10",
-                  headers=headers
-              )
-              if r.status_code == 200:
-                  for item in r.json().get("items", []):
-                      repos[item["clone_url"]] = {
-                          "name": item["name"],
-                          "stars": item["stargazers_count"],
-                          "desc": item.get("description", ""),
-                          "url": item["clone_url"]
-                      }
-
-          # Sort by stars
-          sorted_repos = sorted(repos.values(), key=lambda x: -x["stars"])
-          print(f"Found {len(sorted_repos)} repos:\n")
-          for r in sorted_repos[:30]:
-              print(f"  ⭐{r['stars']:>4} | {r['name']}")
-              print(f"        {r['desc'][:80] if r['desc'] else 'No description'}")
-              print(f"        {r['url']}")
-              print()
-
-          json.dump(sorted_repos, open("repos.json", "w"), indent=2)
-          EOF
-
-      - name: Clone top repos
+      - name: Clone top results
         run: |
           mkdir tools
-          python3 << 'EOF'
-          import json, subprocess, os
+          for r in $(cat r1.json r2.json r3.json r4.json r5.json | grep '"clone_url"' | sed 's/.*"clone_url":"//;s/"//' | sort -u | head -15); do
+            name=$(echo "$r" | sed 's|https://github.com/||;s|\.git||;s|/|_|g')
+            git clone --depth 1 "$r" "tools/$name" 2>/dev/null || true
+          done
+          echo "=== Cloned ==="
+          ls -la tools/
 
-          repos = json.load(open("repos.json"))
-          cloned = []
-
-          for repo in repos[:15]:
-              name = repo["name"].replace("/", "_").replace(" ", "_")
-              url = repo["url"]
-              print(f"Cloning: {name}")
-              try:
-                  subprocess.run(["git", "clone", "--depth", "1", url, f"tools/{name}"],
-                               timeout=30, capture_output=True)
-                  if os.path.exists(f"tools/{name}"):
-                      cloned.append(name)
-                      files = os.listdir(f"tools/{name}")
-                      print(f"  → {len(files)} files: {files[:10]}")
-              except Exception as e:
-                  print(f"  → failed: {e}")
-
-          print(f"\nCloned {len(cloned)} repos")
-          EOF
-
-      - name: Scan cloned tools for keys/scripts
+      - name: Scan for keys
         run: |
-          python3 << 'PYEOF'
-          import os, re, json
+          grep -rE "[0-9a-fA-F]{64}" tools/ --include="*.py" --include="*.lua" --include="*.txt" --include="*.md" --include="*.json" --include="*.h" --include="*.cpp" | head -30
+          echo ""
+          grep -rE "[0-9a-fA-F]{32}" tools/ --include="*.py" --include="*.lua" --include="*.txt" | head -30
+          echo ""
+          grep -ri "puffer\|pak_key\|aes_key\|decrypt" tools/ --include="*.py" --include="*.lua" --include="*.md" -l | head -20
 
-          tools_dir = "tools"
-          findings = {}
-
-          for root, dirs, files in os.walk(tools_dir):
-              for f in files:
-                  fp = os.path.join(root, f)
-                  ext = f.lower().split(".")[-1] if "." in f else ""
-                  
-                  # Text files — читаем
-                  if ext in ["py", "lua", "txt", "md", "json", "cfg", "ini", "yaml", "yml", "sh", "js", "cpp", "h", "c"]:
-                      try:
-                          content = open(fp, 'r', errors='ignore').read()
-                          
-                          # Ищем hex ключи
-                          hex_keys = re.findall(r'[0-9a-fA-F]{32,64}', content)
-                          if hex_keys:
-                              rel = os.path.relpath(fp, tools_dir)
-                              findings[rel] = {
-                                  "hex_keys": list(set(hex_keys))[:10],
-                                  "size": os.path.getsize(fp)
-                              }
-                              print(f"\n[KEY] {rel}")
-                              for k in set(hex_keys[:5]):
-                                  print(f"  {k}")
-                          
-                          # Ищем слова puffer/pak/decrypt/key
-                          keywords = ["puffer", "pak_key", "decrypt", "aes_key", "res_pufferpatch"]
-                          content_lower = content.lower()
-                          found_kw = [kw for kw in keywords if kw in content_lower]
-                          if found_kw:
-                              rel = os.path.relpath(fp, tools_dir)
-                              print(f"[MATCH] {rel}: {found_kw}")
-                              
-                      except:
-                          pass
-
-                  # Binary files — сканируем
-                  elif ext in ["so", "bin", "dat", "dll", "exe"]:
-                      try:
-                          data = open(fp, 'rb').read()
-                          hex_keys = re.findall(rb'[0-9a-fA-F]{64}', data)
-                          if hex_keys:
-                              rel = os.path.relpath(fp, tools_dir)
-                              print(f"\n[BIN KEY] {rel}")
-                              for h in set(hex_keys[:5]):
-                                  print(f"  {h.decode()}")
-                      except:
-                          pass
-
-          print(f"\n[+] Files with keys: {len(findings)}")
-          json.dump(findings, open("key_findings.json", "w"), indent=2)
-          PYEOF
-
-      - name: Try decrypt with found keys
-        run: |
-          python3 << 'PYEOF'
-          import os, re, json
-          from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-
-          PAK = "res_pufferpatch_4.6.0.21559.pak"
-          if not os.path.exists(PAK):
-              print("No pak")
-              exit(1)
-
-          data = open(PAK, 'rb').read()
-          print(f"PAK: {len(data)}b")
-
-          # Собираем все ключи из tools
-          keys = set()
-          for root, dirs, files in os.walk("tools"):
-              for f in files:
-                  fp = os.path.join(root, f)
-                  ext = f.lower().split(".")[-1] if "." in f else ""
-                  if ext in ["py", "lua", "txt", "json", "md", "cfg"]:
-                      try:
-                          content = open(fp, 'r', errors='ignore').read()
-                          for m in re.finditer(r'[0-9a-fA-F]{64}', content):
-                              keys.add(m.group())
-                      except:
-                          pass
-
-          # Из key_findings
-          if os.path.exists("key_findings.json"):
-              findings = json.load(open("key_findings.json"))
-              for fname, info in findings.items():
-                  for k in info.get("hex_keys", []):
-                      if len(k) == 64:
-                          keys.add(k)
-
-          print(f"Testing {len(keys)} keys...")
-
-          for ki, k_hex in enumerate(keys):
-              try:
-                  key = bytes.fromhex(k_hex)
-                  cipher = Cipher(algorithms.AES(key), modes.ECB())
-                  d = cipher.decryptor()
-                  dec = d.update(data[:256]) + d.finalize()
-
-                  for sig, name in [
-                      (b'\x1bLua', 'LUA'), (b'PK\x03\x04', 'ZIP'),
-                      (b'\x78\x9c', 'ZLIB'), (b'\x1f\x8b', 'GZIP'),
-                  ]:
-                      if sig in dec[:128]:
-                          print(f"\n[+] FOUND! Key: {k_hex}")
-                          print(f"    Signature: {name}")
-                          d2 = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
-                          full = d2.update(data) + d2.finalize()
-                          open('decrypted_pak.bin', 'wb').write(full)
-                          print(f"    Saved decrypted_pak.bin")
-                          exit(0)
-              except:
-                  pass
-
-          print("[-] No working key")
-          PYEOF
-
-      - name: Upload tools + findings
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: pubg-tools
+          name: results
           path: |
-            repos.json
-            key_findings.json
-            decrypted_pak.bin
-        if-no-files-found: ignore
-
-      - name: Show tool list
-        run: |
-          echo "=== Cloned tools ==="
-          ls -la tools/
-          echo ""
-          echo "=== Tool contents ==="
-          for d in tools/*/; do
-            echo "--- $d ---"
-            ls "$d" | head -15
-            echo ""
-          done
+            r1.json
+            r2.json
+            r3.json
+            r4.json
+            r5.json
+            tools/
