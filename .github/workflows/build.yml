@@ -1,4 +1,4 @@
-name: PAK Mod Builder
+name: PAK Analysis
 
 on:
   workflow_dispatch:
@@ -11,117 +11,231 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Extract
+      - name: Deep Analysis
         run: |
-          python3 << 'EOF'
-          import os, zlib, json
+          pip install zstandard lz4 brotli
+          python3 << 'PYEOF'
+          import os, zlib, struct, json, io, math
+          from collections import Counter
+
           fn = "res_pufferpatch_4.6.0.21559.pak"
           data = open(fn, "rb").read()
           os.makedirs("extracted", exist_ok=True)
-          pos = 0
-          num = 0
-          streams = []
-          while pos < len(data) and num < 500:
-              idx = data.find(b"\x1f\x8b", pos)
-              if idx < 0:
-                  break
-              try:
-                  d = zlib.decompressobj(31)
-                  dec = d.decompress(data[idx:])
-                  dec += d.flush()
-                  if len(dec) > 0:
-                      end = len(data) - len(d.unused_data)
-                      sf = f"extracted/stream_{num:03d}.bin"
-                      open(sf, "wb").write(dec)
-                      ftype = "binary"
-                      if dec[:4] == b"\x1bLua":
-                          ftype = "LUA"
-                      elif dec[:1] == b"{":
-                          ftype = "JSON"
-                      else:
-                          try:
-                              t = dec[:80].decode("utf-8")
-                              if all(c.isprintable() or c in "\n\r\t" for c in t):
-                                  ftype = "TEXT"
-                          except:
-                              pass
-                      print(f"[{num:02d}] @{idx:#08x} {len(dec)}b {ftype}")
-                      streams.append({"index": num, "start": idx, "end": end, "file": sf, "type": ftype})
-                      num += 1
-                      pos = end
-              except:
+          print(f"Size: {len(data)} bytes")
+
+          # === HEADER (first 2KB) ===
+          print("\n=== HEADER 2KB ===")
+          for i in range(0, min(2048, len(data)), 16):
+              h = " ".join(f"{b:02x}" for b in data[i:i+16])
+              a = "".join(chr(b) if 32 <= b <= 126 else "." for b in data[i:i+16])
+              print(f"{i:04x}: {h}  {a}")
+
+          # === FOOTER ===
+          print("\n=== FOOTER 256b ===")
+          fs = max(0, len(data) - 256)
+          for i in range(fs, len(data), 16):
+              chunk = data[i:i+16]
+              h = " ".join(f"{b:02x}" for b in chunk)
+              a = "".join(chr(b) if 32 <= b <= 126 else "." for b in chunk)
+              print(f"{i:04x}: {h}  {a}")
+
+          # === U32 VALUES ===
+          print("\n=== U32 HEADER ===")
+          for i in range(0, 256, 4):
+              val = struct.unpack("<I", data[i:i+4])[0]
+              if 0 < val < len(data):
+                  print(f"  @{i:#04x}: {val:#010x} ({val}) — possible offset")
+                  preview = data[val:val+8]
+                  print(f"         data there: {preview.hex()}")
+
+          # === ENTROPY MAP ===
+          print("\n=== ENTROPY (4KB blocks) ===")
+          for i in range(0, min(len(data), 65536), 4096):
+              block = data[i:i+4096]
+              if len(block) < 16: break
+              c = Counter(block)
+              ent = -sum((v/len(block)) * math.log2(v/len(block)) for v in c.values())
+              tag = "COMPRESSED" if ent > 7.5 else ("BINARY" if ent > 6 else "RAW/TEXT")
+              print(f"  @{i:#08x}: {ent:.2f} {tag}")
+
+          # === ZLIB SCAN (78 xx headers) ===
+          print("\n=== ZLIB SCAN ===")
+          zlib_headers = [b"\x78\x01", b"\x78\x5e", b"\x78\x9c", b"\x78\xda"]
+          results = 0
+          for zh in zlib_headers:
+              pos = 0
+              while results < 200:
+                  idx = data.find(zh, pos)
+                  if idx < 0: break
+                  try:
+                      d = zlib.decompressobj()
+                      dec = d.decompress(data[idx:idx+1048576])
+                      if len(dec) > 50:
+                          out = f"extracted/zlib_{idx:#08x}.bin"
+                          open(out, "wb").write(dec)
+                          ctype = dec[:20].hex()
+                          print(f"  ZLIB @{idx:#x}: {len(dec)}b [{ctype}]")
+                          results += 1
+                  except:
+                      pass
                   pos = idx + 2
-          print(f"Total: {num}")
-          json.dump(streams, open("streams.json", "w"), indent=2)
-          json.dump({"filename": fn, "size": len(data)}, open("pak_info.json", "w"), indent=2)
-          EOF
 
-      - name: Inject
+          # === TRY AT FIXED OFFSETS ===
+          print("\n=== FIXED OFFSET DECOMPRESS ===")
+          for offset in [0, 4, 8, 12, 16, 20, 24, 28, 32, 40, 48, 64, 128, 256, 512]:
+              if offset >= len(data): break
+              for wbits, name in [(15, "zlib"), (-15, "raw"), (31, "gzip")]:
+                  try:
+                      d = zlib.decompressobj(wbits)
+                      dec = d.decompress(data[offset:])
+                      if len(dec) > 50:
+                          print(f"  @{offset} {name}: {len(dec)}b")
+                          open(f"extracted/off_{offset}_{name}.bin", "wb").write(dec)
+                  except:
+                      pass
+
+          # === BROTLI ===
+          print("\n=== BROTLI SCAN ===")
+          try:
+              import brotli
+              for offset in [0, 4, 8, 12, 16, 20, 24, 32, 64, 128]:
+                  try:
+                      dec = brotli.decompress(data[offset:])
+                      if len(dec) > 50:
+                          print(f"  BROTLI @{offset}: {len(dec)}b")
+                          open(f"extracted/brotli_{offset}.bin", "wb").write(dec)
+                  except:
+                      pass
+          except:
+              print("  brotli not available")
+
+          # === ZSTD SCAN ===
+          print("\n=== ZSTD SCAN ===")
+          try:
+              import zstandard
+              pos = 0
+              while pos < len(data):
+                  idx = data.find(b"\x28\xb5\x2f\xfd", pos)
+                  if idx < 0: break
+                  try:
+                      dctx = zstandard.ZstdDecompressor()
+                      dec = dctx.decompress(data[idx:], max_output_size=10485760)
+                      print(f"  ZSTD @{idx:#x}: {len(dec)}b")
+                      open(f"extracted/zstd_{idx:#08x}.bin", "wb").write(dec)
+                      pos = idx + 4
+                  except:
+                      pos = idx + 4
+          except:
+              print("  zstandard not available")
+
+          # === LZ4 SCAN ===
+          print("\n=== LZ4 SCAN ===")
+          try:
+              import lz4.frame
+              pos = 0
+              while pos < len(data):
+                  idx = data.find(b"\x04\x22\x4d\x18", pos)
+                  if idx < 0: break
+                  try:
+                      dec = lz4.frame.decompress(data[idx:])
+                      print(f"  LZ4 @{idx:#x}: {len(dec)}b")
+                      open(f"extracted/lz4_{idx:#08x}.bin", "wb").write(dec)
+                      pos = idx + 4
+                  except:
+                      pos = idx + 4
+          except:
+              print("  lz4 not available")
+
+          # === XOR BRUTE (single byte) ===
+          print("\n=== XOR SINGLE BYTE ===")
+          for key in range(256):
+              test = bytes(b ^ key for b in data[4:12])
+              # Check for zlib header
+              if test[0:2] in [b"\x78\x01", b"\x78\x9c", b"\x78\xda", b"\x78\x5e"]:
+                  print(f"  XOR {key:#04x} → zlib header at offset 4!")
+                  full = bytes(b ^ key for b in data)
+                  try:
+                      dec = zlib.decompress(full[4:])
+                      print(f"  Decompressed: {len(dec)}b")
+                      open("extracted/xor_zlib.bin", "wb").write(dec)
+                  except:
+                      pass
+              # Check for gzip header
+              if test[0:2] == b"\x1f\x8b":
+                  print(f"  XOR {key:#04x} → gzip header at offset 4!")
+                  full = bytes(b ^ key for b in data)
+                  try:
+                      import gzip
+                      dec = gzip.decompress(full[4:])
+                      print(f"  Decompressed: {len(dec)}b")
+                      open("extracted/xor_gzip.bin", "wb").write(dec)
+                  except:
+                      pass
+              # Check for ZIP
+              if test[0:4] == b"PK\x03\x04":
+                  print(f"  XOR {key:#04x} → ZIP at offset 4!")
+
+          # === CHECK AS ZIP (skip header) ===
+          print("\n=== ZIP CHECK ===")
+          import zipfile
+          for skip in [0, 4, 8, 12, 16]:
+              try:
+                  zf = zipfile.ZipFile(io.BytesIO(data[skip:]))
+                  names = zf.namelist()
+                  print(f"  ZIP (skip {skip}): {len(names)} entries")
+                  for n in names[:20]:
+                      print(f"    {n}")
+                      zf.extract(n, "extracted/")
+                  break
+              except:
+                  pass
+
+          # === TAR CHECK ===
+          print("\n=== TAR CHECK ===")
+          import tarfile
+          for skip in [0, 4, 8, 512]:
+              try:
+                  tf = tarfile.open(fileobj=io.BytesIO(data[skip:]))
+                  names = tf.getnames()
+                  print(f"  TAR (skip {skip}): {len(names)} entries")
+                  for n in names[:20]:
+                      print(f"    {n}")
+                  tf.extractall("extracted/")
+                  break
+              except:
+                  pass
+
+          # === SIGNATURE SCAN ===
+          print("\n=== SIGNATURES ===")
+          for sig, name in [
+              (b"\x1bLua", "LUA"), (b"\x89PNG", "PNG"),
+              (b"\xff\xd8\xff", "JPEG"), (b"PK\x03\x04", "ZIP_IN"),
+              (b"OggS", "OGG"), (b"RIFF", "RIFF"),
+              (b"\x28\xb5\x2f\xfd", "ZSTD"), (b"\x04\x22\x4d\x18", "LZ4"),
+          ]:
+              pos = 0
+              positions = []
+              while len(positions) < 50:
+                  idx = data.find(sig, pos)
+                  if idx < 0: break
+                  positions.append(idx)
+                  pos = idx + 1
+              if positions:
+                  print(f"  {name}: {len(positions)} @ {[f'{p:#x}' for p in positions[:5]]}")
+
+          print(f"\n=== DONE: {len(os.listdir('extracted'))} files extracted ===")
+          PYEOF
+
+      - name: List extracted
         run: |
-          python3 << 'EOF'
-          import os, json, shutil
-          if not os.path.exists("streams.json"):
-              exit(0)
-          streams = json.load(open("streams.json"))
-          mods_dir = "mods"
-          if not os.path.exists(mods_dir) or not os.listdir(mods_dir):
-              print("No mods — extraction only")
-              exit(0)
-          for mfile in sorted(os.listdir(mods_dir)):
-              mpath = os.path.join(mods_dir, mfile)
-              if os.path.isdir(mpath):
-                  continue
-              if mfile.startswith("replace_stream_"):
-                  sidx = int(mfile.replace("replace_stream_", "").split(".")[0])
-                  for s in streams:
-                      if s["index"] == sidx:
-                          print(f"Replacing stream {sidx}")
-                          shutil.copy2(mpath, s["file"])
-                          break
-          EOF
+          echo "=== Files ==="
+          ls -la extracted/ 2>/dev/null
+          echo ""
+          echo "=== File types ==="
+          file extracted/* 2>/dev/null
 
-      - name: Repack
-        run: |
-          python3 << 'EOF'
-          import os, json, gzip, io
-          if not os.path.exists("streams.json"):
-              exit(0)
-          streams = json.load(open("streams.json"))
-          info = json.load(open("pak_info.json"))
-          original = open(info["filename"], "rb").read()
-          output = bytearray(original)
-          mod_count = 0
-          for s in streams:
-              fp = s["file"]
-              if not os.path.exists(fp):
-                  continue
-              content = open(fp, "rb").read()
-              buf = io.BytesIO()
-              with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz:
-                  gz.write(content)
-              new_gz = buf.getvalue()
-              orig_len = s["end"] - s["start"]
-              if len(new_gz) <= orig_len:
-                  output[s["start"]:s["end"]] = new_gz + b"\x00" * (orig_len - len(new_gz))
-                  mod_count += 1
-              else:
-                  print(f"Stream {s['index']}: too big, skip")
-          out_name = "modded_" + info["filename"]
-          open(out_name, "wb").write(bytes(output))
-          print(f"Saved {out_name} — {mod_count} streams modified")
-          EOF
-
-      - name: Upload extracted
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: extracted
-          path: |
-            extracted/
-            streams.json
-
-      - name: Upload modded pak
-        uses: actions/upload-artifact@v4
-        with:
-          name: modded-pak
-          path: modded_*.pak
-        continue-on-error: true
+          name: analysis-results
+          path: extracted/
