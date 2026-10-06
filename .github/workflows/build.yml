@@ -1,4 +1,4 @@
-name: PUBG PAK Decrypt + Mod
+name: PUBG APK Download + Key Extract + PAK Decrypt
 
 on:
   workflow_dispatch:
@@ -11,287 +11,314 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup environment
+      - name: Install deps
         run: |
           pip install cryptography zstandard lz4
           sudo apt-get update -qq
-          sudo apt-get install -y apktool unzip wget curl
+          sudo apt-get install -y wget unzip
 
-      - name: Download PUBG Mobile APK
+      - name: Download APK
         run: |
-          # Скачиваем с APKPure / APKMirror (публичные зеркала)
-          # Вариант 1: APKPure
-          wget -O pubg.apk "https://d.apkpure.com/b/XAPK/com.tencent.ig?version=latest" || true
+          mkdir -p apk
           
-          # Вариант 2: прямая ссылка (может меняться)
-          wget -O pubg.apk "https://pubg-apk.tqdkzvn.dev/pubg-mobile-latest.apk" || true
+          # APKPure
+          wget -q -O apk/pubg.xapk "https://d.apkpure.com/b/XAPK/com.tencent.ig?version=latest" 2>/dev/null || true
           
-          # Вариант 3: с расширением XAPK (zip)
-          if file pubg.apk | grep -qi "zip\|xapk"; then
-            unzip -o pubg.apk -d pubg_xapk/
-            # Ищем основной APK
-            find pubg_xapk/ -name "*.apk" | head -5
+          if [ -f apk/pubg.xapk ]; then
+            file apk/pubg.xapk
+            unzip -o apk/pubg.xapk -d apk/xapk/
+            echo "=== XAPK contents ==="
+            ls -la apk/xapk/
+          else
+            echo "APKPure не сработал"
           fi
           
-          ls -la pubg.apk 2>/dev/null || echo "APK не скачался"
-          ls -la pubg_xapk/ 2>/dev/null
+          # APKMirror fallback
+          if [ ! -f apk/pubg.xapk ]; then
+            wget -q -O apk/pubg.apk "https://d.apkpure.com/b/APK/com.tencent.ig?version=latest" 2>/dev/null || true
+            if [ -f apk/pubg.apk ]; then
+              file apk/pubg.apk
+            fi
+          fi
+          
+          ls -la apk/
 
-      - name: Extract native libraries
+      - name: Extract libs
         run: |
           mkdir -p libs
-          if [ -f pubg.apk ]; then
-            unzip -o pubg.apk "lib/arm64-v8a/*" -d libs/ || true
-            unzip -o pubg.apk "lib/armeabi-v7a/*" -d libs/ || true
-          fi
           
-          # Если XAPK — ищем в подпапках
-          if [ -d pubg_xapk ]; then
-            for apk in $(find pubg_xapk/ -name "*.apk"); do
-              unzip -o "$apk" "lib/arm64-v8a/*" -d libs/ 2>/dev/null || true
-              unzip -o "$apk" "assets/*" -d assets/ 2>/dev/null || true
+          # Если XAPK — это zip с несколькими APK внутри
+          if [ -d apk/xapk ]; then
+            for f in apk/xapk/*.apk; do
+              echo "Extracting from: $f"
+              unzip -o "$f" "lib/arm64-v8a/*.so" -d libs/ 2>/dev/null || true
+              unzip -o "$f" "lib/armeabi-v7a/*.so" -d libs/ 2>/dev/null || true
             done
           fi
           
+          # Если обычный APK
+          if [ -f apk/pubg.apk ]; then
+            unzip -o apk/pubg.apk "lib/arm64-v8a/*.so" -d libs/ 2>/dev/null || true
+          fi
+          
           echo "=== Libraries ==="
-          ls -la libs/lib/arm64-v8a/ 2>/dev/null | head -30
-          ls -la libs/ 2>/dev/null
+          find libs/ -name "*.so" -exec ls -la {} \;
+          
+          # Копируем главные библиотеки
+          for lib in libUE4.so libil2cpp.so libtersafe2.so libshellx_super.so libSGMain.so libSecMon.so; do
+            found=$(find libs/ -name "$lib" | head -1)
+            if [ -n "$found" ]; then
+              cp "$found" ./
+              echo "[+] Copied: $lib ($(stat -c%s "$found") bytes)"
+            fi
+          done
 
-      - name: Extract AES key from libUE4.so
+      - name: Extract AES key
         run: |
           python3 << 'PYEOF'
           import os, re, struct, hashlib
 
-          LIB_PATH = None
-          for root, dirs, files in os.walk("libs"):
+          # Собираем все .so файлы
+          libs = []
+          for f in os.listdir('.'):
+              if f.endswith('.so'):
+                  libs.append(f)
+          for root, dirs, files in os.walk('libs'):
               for f in files:
-                  if "libUE4" in f or "libil2cpp" in f or "libtersafe" in f or "libshellx" in f:
-                      fp = os.path.join(root, f)
-                      size = os.path.getsize(fp)
-                      print(f"[+] Found: {fp} ({size} bytes)")
-                      if not LIB_PATH or size > os.path.getsize(LIB_PATH):
-                          LIB_PATH = fp
+                  if f.endswith('.so'):
+                      libs.append(os.path.join(root, f))
 
-          if not LIB_PATH:
-              print("[-] No native libraries found")
+          if not libs:
+              print("[-] No .so files found")
               exit(1)
 
-          print(f"\n[*] Scanning {LIB_PATH} for AES keys...")
+          all_keys = set()
 
-          data = open(LIB_PATH, "rb").read()
+          for lib_path in libs:
+              size = os.path.getsize(lib_path)
+              if size < 1000:
+                  continue
+              print(f"\n=== {lib_path} ({size} bytes) ===")
 
-          # Pattern 1: 32-byte hex string (AES-256 key)
-          print("\n--- Pattern 1: 64-char hex strings ---")
-          hex_strings = re.findall(rb'[0-9a-fA-F]{64}', data)
-          unique = []
-          seen = set()
-          for h in hex_strings:
-              if h not in seen:
-                  seen.add(h)
-                  unique.append(h)
-          
-          for h in unique[:30]:
-              key_bytes = bytes.fromhex(h.decode())
-              print(f"  {h.decode()[:32]}... @{data.find(h):#x}")
+              data = open(lib_path, 'rb').read()
 
-          # Pattern 2: 16-byte hex string (AES-128)
-          print("\n--- Pattern 2: 32-char hex strings ---")
-          hex_16 = re.findall(rb'[0-9a-fA-F]{32}', data)
-          seen16 = set()
-          for h in hex_16:
-              if h not in seen16:
-                  seen16.add(h)
-                  print(f"  {h.decode()} @{data.find(h):#x}")
+              # 64-char hex strings (AES-256 keys)
+              hex64 = re.findall(rb'[0-9a-fA-F]{64}', data)
+              for h in set(hex64):
+                  off = data.find(h)
+                  kb = bytes.fromhex(h.decode())
+                  # Фильтр — ключ не должен быть нулями
+                  if kb != b'\x00' * 32 and len(set(kb)) > 10:
+                      print(f"  HEX64 @{off:#x}: {h.decode()}")
+                      all_keys.add(h.decode())
 
-          # Pattern 3: Raw 32-byte high-entropy blocks (potential raw AES keys)
-          print("\n--- Pattern 3: High-entropy 32-byte blocks ---")
-          candidates = []
-          for offset in range(0, min(len(data) - 32, 50_000_000), 4):
-              block = data[offset:offset+32]
-              # Check if it looks like a key (high entropy, not all zeros)
-              if len(set(block)) > 20 and block != b'\x00' * 32:
-                  # Check if surrounded by alignment padding
-                  before = data[offset-4:offset]
-                  after = data[offset+32:offset+36]
-                  if before in [b'\x00\x00\x00\x00', b'\xcc\xcc\xcc\xcc'] or \
-                     after in [b'\x00\x00\x00\x00', b'\xcc\xcc\xcc\xcc']:
-                      candidates.append(offset)
-          
-          print(f"  Found {len(candidates)} candidates")
-          for c in candidates[:20]:
-              key = data[c:c+32]
-              print(f"  @{c:#010x}: {key.hex()}")
+              # 32-char hex strings (AES-128 keys)
+              hex32 = re.findall(rb'[0-9a-fA-F]{32}', data)
+              for h in set(hex32):
+                  off = data.find(h)
+                  kb = bytes.fromhex(h.decode())
+                  if kb != b'\x00' * 16 and len(set(kb)) > 8:
+                      print(f"  HEX32 @{off:#x}: {h.decode()}")
+                      all_keys.add(h.decode())
 
-          # Pattern 4: Search for "aesk" / "pak" / "key" markers near hex strings
-          print("\n--- Pattern 4: Key markers ---")
-          for marker in [b'aesk', b'pak_key', b'encryption_key', b'pakkey', b'AES_KEY', b'secret']:
-              pos = 0
-              while True:
-                  idx = data.find(marker, pos)
-                  if idx < 0:
-                      break
-                  # Look for hex string nearby
-                  context = data[max(0, idx-64):idx+128]
-                  hex_in_ctx = re.findall(rb'[0-9a-fA-F]{32,64}', context)
-                  if hex_in_ctx:
-                      for h in hex_in_ctx:
-                          print(f"  [{marker.decode()}] @{idx:#x}: {h.decode()}")
-                  pos = idx + 1
+              # Key markers
+              for marker in [b'pak_key', b'aes_key', b'PAKKEY', b'encryption_key', b'secret_key']:
+                  idx = 0
+                  while True:
+                      idx = data.find(marker, idx)
+                      if idx < 0: break
+                      ctx = data[max(0,idx-32):idx+128]
+                      hexes = re.findall(rb'[0-9a-fA-F]{32,64}', ctx)
+                      for h in hexes:
+                          print(f"  MARKER[{marker.decode()}] @{idx:#x}: {h.decode()}")
+                          all_keys.add(h.decode())
+                      idx += 1
 
-          # Pattern 5: Search for known PUBG Mobile key patterns
-          print("\n--- Pattern 5: Known PUBG patterns ---")
-          # PUBG Mobile uses specific key generation based on version
-          # Search for base64 strings near "pak" or "encrypt"
-          for marker in [b'pak', b'PAK', b'encrypt', b'ENCRYPT']:
-              pos = 0
-              while True:
-                  idx = data.find(marker, pos)
-                  if idx < 0:
-                      break
-                  context = data[max(0, idx-32):idx+96]
-                  # Look for printable strings
-                  strings_in_ctx = re.findall(rb'[\x20-\x7e]{16,}', context)
-                  for s in strings_in_ctx:
-                      s_dec = s.decode()
-                      if any(c in s_dec.lower() for c in ['key', 'aes', 'crypt', 'secret']):
-                          print(f"  @{idx:#x}: {s_dec}")
-                  pos = idx + 1
+              # Raw high-entropy 32-byte blocks near "pak" strings
+              for marker in [b'puffer', b'pak', b'PAK']:
+                  idx = 0
+                  while True:
+                      idx = data.find(marker, idx)
+                      if idx < 0: break
+                      # Check nearby 32-byte blocks
+                      for delta in [-64, -32, 0, 32, 64, 128]:
+                          off = idx + delta
+                          if 0 <= off < len(data) - 32:
+                              block = data[off:off+32]
+                              if len(set(block)) > 20:
+                                  print(f"  RAW near '{marker.decode()}' @{off:#x}: {block.hex()}")
+                                  all_keys.add(block.hex())
+                      idx += 1
 
-          # Pattern 6: Scan for 64-char hex in .rodata section
-          print("\n--- Pattern 6: .rodata section ---")
-          # ELF parsing — find .rodata
-          if data[:4] == b'\x7fELF':
-              # ELF header
-              e_shoff = struct.unpack('<Q', data[0x28:0x30])[0]
-              e_shentsize = struct.unpack('<H', data[0x3A:0x3C])[0]
-              e_shnum = struct.unpack('<H', data[0x3C:0x3E])[0]
-              e_shstrndx = struct.unpack('<H', data[0x3E:0x40])[0]
-              
-              sections = []
-              for i in range(e_shnum):
-                  sh_off = e_shoff + i * e_shentsize
-                  sh_name = struct.unpack('<I', data[sh_off:sh_off+4])[0]
-                  sh_type = struct.unpack('<I', data[sh_off+4:sh_off+8])[0]
-                  sh_offset = struct.unpack('<Q', data[sh_off+24:sh_off+32])[0]
-                  sh_size = struct.unpack('<Q', data[sh_off+32:sh_off+40])[0]
-                  sections.append({"offset": sh_offset, "size": sh_size, "type": sh_type})
-              
-              # Find string table
-              strtab = sections[e_shstrndx]
-              strtab_data = data[strtab["offset"]:strtab["offset"]+strtab["size"]]
-              
-              for i, sec in enumerate(sections):
-                  # Section names
-                  name_off = struct.unpack('<I', data[e_shoff + i * e_shentsize:e_shoff + i * e_shentsize + 4])[0]
-                  name_end = strtab_data.find(b'\x00', name_off)
-                  sec_name = strtab_data[name_off:name_end].decode('utf-8', errors='replace')
-                  
-                  if sec_name == '.rodata':
-                      rodata = data[sec["offset"]:sec["offset"]+sec["size"]]
-                      print(f"  .rodata: @{sec['offset']:#x} ({sec['size']}b)")
-                      
-                      # Scan for hex strings
-                      hex_rodata = re.findall(rb'[0-9a-fA-F]{64}', rodata)
-                      for h in hex_rodata[:20]:
-                          print(f"  HEX-64: {h.decode()[:32]}...")
-                      
-                      hex_rodata_32 = re.findall(rb'[0-9a-fA-F]{32}', rodata)
-                      for h in hex_rodata_32[:20]:
-                          print(f"  HEX-32: {h.decode()}")
+          # Save all unique keys
+          with open('found_keys.txt', 'w') as f:
+              for k in sorted(all_keys):
+                  f.write(k + '\n')
 
+          print(f"\n[+] Total unique keys: {len(all_keys)}")
+          for k in sorted(all_keys):
+              print(f"  {k}")
           PYEOF
 
-      - name: Try decrypt pak with found keys
+      - name: Decrypt PAK with found keys
         run: |
           python3 << 'PYEOF'
-          import os, struct, zlib, json, hashlib
+          import os, struct, zlib, json, math
+          from collections import Counter
           from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-          PAK_FILE = "res_pufferpatch_4.6.0.21559.pak"
-          data = open(PAK_FILE, "rb").read()
-          print(f"PAK size: {len(data)}")
+          PAK = "res_pufferpatch_4.6.0.21559.pak"
+          if not os.path.exists(PAK):
+              print("[-] No pak file")
+              exit(1)
 
-          # Собираем все ключи из предыдущего шага
-          # (в реальном workflow нужно передать из предыдущего шага)
-          # Здесь пробуем подходы
+          data = open(PAK, 'rb').read()
+          print(f"PAK: {len(data)} bytes, magic: {data[:4].hex()}")
 
-          # Approach 1: Check if header (first 16 bytes) contains key info
-          header = data[:16]
-          print(f"Header: {header.hex()}")
+          # Load keys
+          keys = []
+          if os.path.exists('found_keys.txt'):
+              for line in open('found_keys.txt'):
+                  k = line.strip()
+                  if len(k) == 64:
+                      keys.append(bytes.fromhex(k))
+                  elif len(k) == 32:
+                      keys.append(bytes.fromhex(k).ljust(32, b'\x00'))
 
-          # Approach 2: Tencent uses XOR + AES combination
-          # Try common Tencent patterns
-          magic = data[:4]  # 63a901cd
+          print(f"Testing {len(keys)} keys...")
 
-          # Approach 3: Try decrypting with known PUBG Mobile keys
-          KNOWN_KEYS = [
-              # Исторические ключи PUBG Mobile (могут быть устаревшими)
-              "5E4C0A9C6D8B3F2A1E7D4C9B0A8F7E6D5C4B3A2F1E0D9C8B7A6F5E4D3C2B1A0",
-              # Placeholder — реальные ключи находят в libUE4.so
-          ]
+          # Test each key against first 64 bytes of data
+          for ki, key in enumerate(keys):
+              for mode_name, mode in [("ECB", modes.ECB()), ("CBC-zero-iv", modes.CBC(b'\x00'*16))]:
+                  try:
+                      cipher = Cipher(algorithms.AES(key), mode)
+                      dec = cipher.decryptor()
+                      # Decrypt first 128 bytes (8 AES blocks)
+                      decrypted = dec.update(data[:128]) + dec.finalize()
 
-          # Approach 4: Scan entire file for AES-ECB patterns
-          # AES-ECB blocks of 16 bytes — если данные AES-ECB, одинаковый plaintext = одинаковый ciphertext
-          print("\n=== ECB Pattern Detection ===")
-          ecb_blocks = {}
-          for i in range(0, min(len(data) - 16, 100000), 16):
-              block = data[i:i+16]
-              if block in ecb_blocks:
-                  ecb_blocks[block].append(i)
-              else:
-                  ecb_blocks[block] = [i]
+                      # Check for known signatures
+                      for sig, name in [
+                          (b'\x1bLua', 'LUA'), (b'PK\x03\x04', 'ZIP'),
+                          (b'\x78\x01', 'ZLIB'), (b'\x1f\x8b', 'GZIP'),
+                          (b'PNG', 'PNG'), (b'OggS', 'OGG'),
+                      ]:
+                          if decrypted[:len(sig)] == sig or sig in decrypted[:64]:
+                              print(f"\n[+] KEY FOUND! #{ki} {mode_name}")
+                              print(f"    Key: {key.hex()}")
+                              print(f"    Signature: {name}")
+                              print(f"    Decrypted head: {decrypted[:32].hex()}")
+                              print(f"    Decrypted text: {decrypted[:60]}")
 
-          repeated = {k: v for k, v in ecb_blocks.items() if len(v) > 1}
-          if repeated:
-              print(f"  [+] Found {len(repeated)} repeated 16-byte blocks — likely ECB mode!")
-              for block, offsets in list(repeated.items())[:10]:
-                  print(f"    {block.hex()[:16]}... @ {[f'{o:#x}' for o in offsets[:5]]}")
-          else:
-              print(f"  [-] No ECB patterns found")
+                              # Save full decryption
+                              dec2 = Cipher(algorithms.AES(key), mode).decryptor()
+                              full_dec = dec2.update(data) + dec2.finalize()
+                              open('decrypted_pak.bin', 'wb').write(full_dec)
+                              print(f"    Saved decrypted_pak.bin ({len(full_dec)}b)")
 
-          # Approach 5: Try known UE4 pak encryption
-          # UE4 FAES::DecryptData with key from pak index
-          # Pufferpatch может использовать свой формат
+                      # Check if entropy dropped (decryption worked)
+                      c = Counter(decrypted[:128])
+                      if len(c) > 5:
+                          ent = -sum((v/len(decrypted[:128])) * math.log2(v/len(decrypted[:128])) for v in c.values())
+                          if ent < 6.0:
+                              print(f"  Key #{ki} {mode_name}: LOW ENTROPY {ent:.2f} — possible hit!")
+                              print(f"    Key: {key.hex()}")
+                              print(f"    Data: {decrypted[:32].hex()}")
+                  except Exception as e:
+                      pass
 
-          # Approach 6: Brute force XOR with common Tencent keys
-          print("\n=== XOR with Tencent patterns ===")
-          TENCENT_KEYS = [
-              b"\x63\xa9\x01\xcd",  # сам magic
-              b"\xcd\x01\xa9\x63",  # reversed
-              b"\x00\x01\x02\x03",
-              b"\xde\xad\xbe\xef",
-              b"\xca\xfe\xba\xbe",
-          ]
+          # Also try decrypting the index (assuming it's at the end)
+          print("\n=== Decrypting last 256 bytes (possible index) ===")
+          for ki, key in enumerate(keys):
+              try:
+                  cipher = Cipher(algorithms.AES(key), modes.ECB())
+                  dec = cipher.decryptor()
+                  dec_last = dec.update(data[-256:]) + dec.finalize()
+                  # Check for readable strings
+                  strings = [dec_last[i:i+4] for i in range(0, len(dec_last), 4)]
+                  printable = sum(1 for s in strings if all(32 <= b <= 126 for b in s))
+                  if printable > 10:
+                      print(f"  Key #{ki}: {printable}/64 printable blocks")
+                      print(f"    {dec_last[:64]}")
+              except:
+                  pass
 
-          for tk in TENCENT_KEYS:
-              test = bytes(a ^ b for a, b in zip(data[4:36], tk * 8))
-              # Check if result looks like zlib or gzip
-              if test[:2] in [b"\x78\x01", b"\x78\x9c", b"\x78\xda", b"\x78\x5e"]:
-                  print(f"  XOR with {tk.hex()} → zlib!")
-                  break
-              if test[:2] == b"\x1f\x8b":
-                  print(f"  XOR with {tk.hex()} → gzip!")
-                  break
+          # Try XOR with each key on header
+          print("\n=== XOR testing ===")
+          for ki, key in enumerate(keys):
+              for xor_len in [4, 8, 16]:
+                  xk = key[:xor_len]
+                  test = bytes(a ^ b for a, b in zip(data[:64], (xk * (64 // xor_len + 1))[:64]))
+                  if test[:2] in [b'\x78\x01', b'\x78\x9c', b'\x78\xda']:
+                      print(f"  XOR key #{ki} len={xor_len} → ZLIB!")
+                      print(f"    Key: {key.hex()}")
+                      break
+                  if test[:2] == b'\x1f\x8b':
+                      print(f"  XOR key #{ki} len={xor_len} → GZIP!")
+                      break
 
-          # Approach 7: Check if data @ offset 4 onwards is valid AES-CTR or AES-CBC
-          # Without IV/nonce — hard to determine without key
-
-          # Approach 8: Look at entropy
-          print("\n=== Entropy check ===")
-          from collections import Counter
-          import math
-          for start in [0, 1024, 10240, 102400]:
-              block = data[start:start+4096]
-              c = Counter(block)
-              ent = -sum((v/len(block)) * math.log2(v/len(block)) for v in c.values())
-              print(f"  @{start}: entropy={ent:.2f} {'ENCRYPTED' if ent > 7.9 else 'COMPRESSED' if ent > 7.0 else 'RAW'}")
-
+          print("\n=== Done ===")
           PYEOF
+
+      - name: If decrypted — extract content
+        run: |
+          if [ -f decrypted_pak.bin ]; then
+            python3 << 'PYEOF'
+            import os, zlib, json
+
+            data = open('decrypted_pak.bin', 'rb').read()
+            os.makedirs('extracted', exist_ok=True)
+
+            # Try carving zlib/gzip from decrypted data
+            pos = 0
+            num = 0
+            while pos < len(data) and num < 500:
+                idx = data.find(b'\x1f\x8b', pos)
+                if idx < 0:
+                    idx2 = data.find(b'\x78\x9c', pos)
+                    if idx2 < 0:
+                        idx2 = data.find(b'\x78\x01', pos)
+                    idx = idx2
+                if idx < 0:
+                    break
+
+                for wbits in [31, 15]:
+                    try:
+                        d = zlib.decompressobj(wbits)
+                        dec = d.decompress(data[idx:idx+1048576])
+                        if len(dec) > 20:
+                            ftype = dec[:20].hex()
+                            out = f"extracted/file_{num:03d}_{ftype[:12]}.bin"
+                            open(out, 'wb').write(dec)
+                            print(f"[{num:02d}] @{idx:#x} → {len(dec)}b [{dec[:16]}]")
+                            num += 1
+                        break
+                    except:
+                        continue
+                pos = idx + 2
+
+            print(f"\nExtracted: {num} files")
+            PYEOF
+          else
+            echo "No decrypted_pak.bin — decryption failed"
+          fi
 
       - name: Upload results
         uses: actions/upload-artifact@v4
-        key: analysis
         with:
-          name: pubg-analysis
+          name: pubg-results
           path: |
-            libs/
+            found_keys.txt
+            decrypted_pak.bin
             extracted/
+          if-no-files-found: ignore
+
+      - name: Upload libs (for manual analysis)
+        uses: actions/upload-artifact@v4
+        with:
+          name: pubg-libs
+          path: |
+            libUE4.so
+            libil2cpp.so
+            libtersafe2.so
+            libs/
+          if-no-files-found: ignore
